@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tankio2-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tankio2
+      POSTGRES_PASSWORD: tankio2
+      POSTGRES_DB: tankio2
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "55433:5432"
+    volumes:
+      - tankio2-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tankio2 -d tankio2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tankio2-postgres:
