@@ -3,6 +3,7 @@ import {
   addPlayer,
   createRoom,
   removePlayer,
+  retryPlayer,
   setPlayerInput,
   snapshotForPlayer,
   summarizePlayer,
@@ -143,6 +144,11 @@ export class RoomManager {
       return;
     }
 
+    if (message.type === 'retry') {
+      retryPlayer(this.room, client.playerId);
+      return;
+    }
+
     if (message.type === 'upgradeStat') {
       upgradePlayerStat(this.room, client.playerId, message.stat as StatKey);
       return;
@@ -157,7 +163,7 @@ export class RoomManager {
     const client = this.clients.get(socket);
     if (!client) return;
     const player = removePlayer(this.room, client.playerId);
-    if (player) this.persistDisconnect(player);
+    if (player?.alive) this.persistDisconnect(player);
     this.clients.delete(socket);
     this.playerSockets.delete(client.playerId);
   }

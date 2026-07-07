@@ -17,6 +17,8 @@ const WORLD_HEIGHT = 4200;
 const MAX_SHAPES = 260;
 const PLAYER_RESPAWN_MS = 2200;
 const INPUT_DEADZONE = 0.05;
+const SAFE_SPAWN_DISTANCE = 700;
+const SPAWN_CANDIDATE_LIMIT = 64;
 
 type ShapeKind = 'square' | 'triangle' | 'pentagon' | 'alpha_pentagon';
 
@@ -408,8 +410,19 @@ export function summarizePlayer(player: MatchPlayer, room: GameRoom): Simulation
   };
 }
 
+export function retryPlayer(room: GameRoom, playerId: string): boolean {
+  const player = room.players.get(playerId);
+  if (!player || player.alive || player.bot) return false;
+  respawnPlayer(room, player);
+  return true;
+}
+
 function updatePlayer(room: GameRoom, player: MatchPlayer, dt: number, dtMs: number): void {
   if (!player.alive) {
+    if (!player.bot) {
+      player.respawnMs = 0;
+      return;
+    }
     player.respawnMs -= dtMs;
     if (player.respawnMs <= 0) respawnPlayer(room, player);
     return;
@@ -616,7 +629,7 @@ function killPlayer(room: GameRoom, victim: MatchPlayer, killerId: string | unde
   if (!victim.alive) return;
   const killer = killerId ? room.players.get(killerId) : undefined;
   victim.alive = false;
-  victim.respawnMs = PLAYER_RESPAWN_MS;
+  victim.respawnMs = victim.bot ? PLAYER_RESPAWN_MS : 0;
   victim.deaths += 1;
   victim.health = 0;
   victim.revealedMs = 1200;
@@ -803,10 +816,40 @@ function refillShapes(room: GameRoom): void {
 }
 
 function randomSpawn(room: GameRoom): { x: number; y: number } {
+  const blockers = [...room.players.values()].filter((player) => player.alive);
+  let safestPosition: { x: number; y: number } | undefined;
+  let safestDistance = -Infinity;
+
+  for (let attempt = 0; attempt < SPAWN_CANDIDATE_LIMIT; attempt += 1) {
+    const position = randomSpawnCandidate(room);
+    if (blockers.length === 0) return position;
+
+    const nearestBlockerDistance = nearestDistanceToPlayers(position, blockers);
+    if (nearestBlockerDistance >= SAFE_SPAWN_DISTANCE) return position;
+
+    // Keep the best sampled fallback so crowded rooms still spawn immediately.
+    if (nearestBlockerDistance > safestDistance) {
+      safestDistance = nearestBlockerDistance;
+      safestPosition = position;
+    }
+  }
+
+  return safestPosition ?? randomSpawnCandidate(room);
+}
+
+function randomSpawnCandidate(room: GameRoom): { x: number; y: number } {
   return {
     x: 160 + room.rng() * (room.width - 320),
     y: 160 + room.rng() * (room.height - 320),
   };
+}
+
+function nearestDistanceToPlayers(position: { x: number; y: number }, players: MatchPlayer[]): number {
+  let nearest = Infinity;
+  for (const player of players) {
+    nearest = Math.min(nearest, distance(position, player));
+  }
+  return nearest;
 }
 
 function cleanName(name: string): string {

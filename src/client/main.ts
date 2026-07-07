@@ -78,6 +78,7 @@ class TankioClient {
   connected = false;
   joined = false;
   private socket?: WebSocket;
+  private connectionId = 0;
   private readonly snapshotHistory: TimedSnapshot[] = [];
 
   async hydrateSavedProfile(name: string): Promise<GuestSession | undefined> {
@@ -93,22 +94,46 @@ class TankioClient {
 
   async connect(name: string, mode: 'online' | 'bots'): Promise<void> {
     const guest = await this.ensureGuestProfile(name);
+    this.disconnect();
+    const connectionId = this.connectionId;
     this.joined = false;
 
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(`${SERVER_WS}/ws`);
       this.socket = socket;
       socket.addEventListener('open', () => {
+        if (!this.isCurrentSocket(socket, connectionId)) return;
         this.connected = true;
         this.send({ type: 'join', token: guest.token, name, mode });
         resolve();
       });
-      socket.addEventListener('message', (event) => this.handleMessage(event.data.toString()));
-      socket.addEventListener('close', () => {
-        this.connected = false;
+      socket.addEventListener('message', (event) => {
+        if (this.isCurrentSocket(socket, connectionId)) this.handleMessage(event.data.toString());
       });
-      socket.addEventListener('error', () => reject(new Error('WebSocket connection failed.')));
+      socket.addEventListener('close', () => {
+        if (!this.isCurrentSocket(socket, connectionId)) return;
+        this.connected = false;
+        this.joined = false;
+        this.socket = undefined;
+      });
+      socket.addEventListener('error', () => {
+        if (this.isCurrentSocket(socket, connectionId)) reject(new Error('WebSocket connection failed.'));
+      });
     });
+  }
+
+  disconnect(): void {
+    const socket = this.socket;
+    this.connectionId += 1;
+    this.socket = undefined;
+    this.connected = false;
+    this.joined = false;
+    this.snapshot = undefined;
+    this.snapshotHistory.length = 0;
+
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      socket.close(1000, 'Return to menu');
+    }
   }
 
   send(message: object): void {
@@ -117,8 +142,13 @@ class TankioClient {
   }
 
   sendInput(input: ClientInputPayload): void {
-    if (!this.joined) return;
+    if (!this.joined || this.snapshot?.self.alive === false) return;
     this.send({ type: 'input', input });
+  }
+
+  retry(): void {
+    if (!this.joined) return;
+    this.send({ type: 'retry' });
   }
 
   upgradeStat(stat: StatKey): void {
@@ -178,6 +208,10 @@ class TankioClient {
     }
   }
 
+  private isCurrentSocket(socket: WebSocket, connectionId: number): boolean {
+    return this.socket === socket && this.connectionId === connectionId;
+  }
+
   private async requestGuestProfile(name: string, token?: string): Promise<GuestSession> {
     const response = await fetch(`${SERVER_HTTP}/api/guest`, {
       method: 'POST',
@@ -217,7 +251,10 @@ class HudController {
   private readonly score: HTMLDivElement;
   private readonly level: HTMLDivElement;
   private readonly healthFill: HTMLDivElement;
-  private readonly deathTimer: HTMLSpanElement;
+  private readonly deathScore: HTMLElement;
+  private readonly deathXp: HTMLElement;
+  private readonly deathRetryButton: HTMLButtonElement;
+  private readonly deathMenuButton: HTMLButtonElement;
   private lastProfileKey = '';
   private lastStatusKey = '';
   private lastStatsKey = '';
@@ -358,7 +395,18 @@ class HudController {
           </div>
           <div class="stat-panel"></div>
           <div class="upgrade-panel"></div>
-          <div class="death"><strong>Rebuilding</strong><span></span></div>
+          <div class="death" role="dialog" aria-modal="true" aria-labelledby="death-title">
+            <strong id="death-title">Tank Destroyed</strong>
+            <span class="death-summary">Run ended</span>
+            <div class="death-stats">
+              <span><b data-death-score>0</b><small>Score</small></span>
+              <span><b data-death-xp>0</b><small>Run XP</small></span>
+            </div>
+            <div class="death-actions">
+              <button class="death-button death-button--retry" type="button" data-death-retry>Retry</button>
+              <button class="death-button death-button--menu" type="button" data-death-menu>Main Screen</button>
+            </div>
+          </div>
         </section>
       </div>
     `;
@@ -386,7 +434,10 @@ class HudController {
     this.score = this.status.querySelector('.score-line') as HTMLDivElement;
     this.level = this.status.querySelector('.level-pill') as HTMLDivElement;
     this.healthFill = this.status.querySelector('.bar-fill') as HTMLDivElement;
-    this.deathTimer = this.death.querySelector('span') as HTMLSpanElement;
+    this.deathScore = this.death.querySelector('[data-death-score]') as HTMLElement;
+    this.deathXp = this.death.querySelector('[data-death-xp]') as HTMLElement;
+    this.deathRetryButton = this.death.querySelector('[data-death-retry]') as HTMLButtonElement;
+    this.deathMenuButton = this.death.querySelector('[data-death-menu]') as HTMLButtonElement;
 
     this.joinButtons.forEach((button) => {
       button.addEventListener('click', () => {
@@ -398,6 +449,14 @@ class HudController {
     this.autoFireButton.addEventListener('click', () => {
       this.inputState.autoFire = !this.inputState.autoFire;
       this.renderCombatControls();
+    });
+
+    this.deathRetryButton.addEventListener('click', () => {
+      this.client.retry();
+    });
+
+    this.deathMenuButton.addEventListener('click', () => {
+      void this.returnToMainScreen();
     });
 
     this.stats.addEventListener('click', (event) => {
@@ -467,11 +526,11 @@ class HudController {
       this.lastLeaderboardKey = leaderboardKey;
     }
 
-    const respawnSeconds = Math.ceil(self.respawnMs / 1000);
-    const deathKey = `${self.alive}|${respawnSeconds}`;
+    const deathKey = `${self.alive}|${self.score}|${self.sessionXp}`;
     if (deathKey !== this.lastDeathKey) {
       this.death.classList.toggle('visible', !self.alive);
-      this.deathTimer.textContent = `${respawnSeconds}s`;
+      this.deathScore.textContent = self.score.toLocaleString();
+      this.deathXp.textContent = self.sessionXp.toLocaleString();
       this.lastDeathKey = deathKey;
     }
   }
@@ -521,6 +580,8 @@ class HudController {
     this.setMenuBusy(true, mode === 'bots' ? 'Starting bot arena' : 'Joining online arena');
     try {
       await this.client.connect(this.nameInput.value, mode);
+      this.death.classList.remove('visible');
+      this.lastDeathKey = '';
       this.menu.classList.add('hidden');
       this.hud.classList.add('visible');
     } catch (error) {
@@ -540,6 +601,20 @@ class HudController {
 
   private setMenuStatus(status: string): void {
     this.menuStatus.textContent = status;
+  }
+
+  private async returnToMainScreen(): Promise<void> {
+    this.client.disconnect();
+    this.inputState.autoFire = false;
+    this.inputState.autoSpin = false;
+    this.lastAutoFire = undefined;
+    this.lastDeathKey = '';
+    this.death.classList.remove('visible');
+    this.hud.classList.remove('visible');
+    this.menu.classList.remove('hidden');
+    this.renderCombatControls();
+    this.setMenuBusy(false, 'Ready');
+    await this.hydrateSavedProfile();
   }
 
   private renderCombatControls(): void {
@@ -605,6 +680,12 @@ class ArenaScene extends Phaser.Scene {
       return;
     }
     this.renderWorld();
+    const snapshot = this.client.getRenderSnapshot();
+    if (snapshot?.self.alive === false) {
+      this.fire = false;
+      this.altFire = false;
+      return;
+    }
     if (time - this.lastInputSent > 33) {
       this.lastInputSent = time;
       this.client.sendInput(this.buildInput());

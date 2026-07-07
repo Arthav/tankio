@@ -23,6 +23,9 @@ export type ClientMessage =
       input: ClientInputPayload;
     }
   | {
+      type: 'retry';
+    }
+  | {
       type: 'upgradeStat';
       stat: StatKey;
     }
