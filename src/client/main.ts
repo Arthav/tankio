@@ -1,5 +1,14 @@
 import Phaser from 'phaser';
 import './styles.css';
+import botArenaUrl from './assets/dashboard/bot-arena.png';
+import logoMascotUrl from './assets/dashboard/logo-mascot.png';
+import onlineArenaUrl from './assets/dashboard/online-arena.png';
+import profileAvatarUrl from './assets/dashboard/profile-avatar.png';
+import routeMapUrl from './assets/dashboard/route-map.png';
+import tankFlankGuardUrl from './assets/dashboard/tank-flank-guard.png';
+import tankMachineGunUrl from './assets/dashboard/tank-machine-gun.png';
+import tankSniperUrl from './assets/dashboard/tank-sniper.png';
+import tankTwinUrl from './assets/dashboard/tank-twin.png';
 import type {
   ClientInputPayload,
   GameSnapshot,
@@ -38,6 +47,23 @@ interface GuestSession {
 
 const CUSTOM_BRANCH_UNLOCK_XP = 8000;
 const STARTER_PATHS = TANK_CLASSES.filter((tankClass) => tankClass.unlockLevel === 15 && tankClass.parents.includes('basic'));
+const DASHBOARD_ASSETS = {
+  botArena: botArenaUrl,
+  logoMascot: logoMascotUrl,
+  onlineArena: onlineArenaUrl,
+  profileAvatar: profileAvatarUrl,
+  routeMap: routeMapUrl,
+  tankFlankGuard: tankFlankGuardUrl,
+  tankMachineGun: tankMachineGunUrl,
+  tankSniper: tankSniperUrl,
+  tankTwin: tankTwinUrl,
+} as const;
+const STARTER_PATH_ASSETS: Record<string, string> = {
+  flank_guard: DASHBOARD_ASSETS.tankFlankGuard,
+  machine_gun: DASHBOARD_ASSETS.tankMachineGun,
+  sniper: DASHBOARD_ASSETS.tankSniper,
+  twin: DASHBOARD_ASSETS.tankTwin,
+};
 const ACHIEVEMENT_LABELS: Record<string, string> = {
   first_destroy: 'First Destroy',
   first_upgrade: 'First Upgrade',
@@ -174,6 +200,7 @@ class HudController {
   private readonly joinButtons: HTMLButtonElement[];
   private readonly profileStrip: HTMLDivElement;
   private readonly profileName: HTMLElement;
+  private readonly profileLevel: HTMLElement;
   private readonly menuStatus: HTMLDivElement;
   private readonly branchValue: HTMLElement;
   private readonly branchFill: HTMLDivElement;
@@ -210,69 +237,101 @@ class HudController {
         <section class="menu start-lobby" aria-label="Tankio2 start lobby">
           <div class="lobby-grid">
             <aside class="play-dock lobby-panel">
-              <div class="brand">
-                <div class="brand-mark"></div>
-                <div>
-                  <p class="brand-kicker">FFA arena</p>
-                  <h1>Tankio2</h1>
+              <div class="brand-lockup">
+                <img class="brand-mascot" src="${DASHBOARD_ASSETS.logoMascot}" alt="Blue Tankio2 tank mascot" />
+                <h1>TANKIO2</h1>
+              </div>
+              <div class="mode-ribbon" aria-label="Selected arena mode">
+                <span class="star-chip" aria-hidden="true"></span>
+                <strong>FFA ARENA</strong>
+                <span class="star-chip" aria-hidden="true"></span>
+              </div>
+              <div class="field pilot-field">
+                <label for="pilot-name">Pilot</label>
+                <div class="input-wrap">
+                  <span class="pilot-icon" aria-hidden="true"></span>
+                  <input id="pilot-name" maxlength="18" value="Pilot" autocomplete="off" />
                 </div>
               </div>
-              <div class="field">
-                <label for="pilot-name">Pilot</label>
-                <input id="pilot-name" maxlength="18" value="Pilot" autocomplete="off" />
-              </div>
               <div class="menu-actions">
-                <button class="primary join-button" data-join="online" type="button">
-                  <span>Online Arena</span>
-                  <b>FFA room</b>
+                <button class="join-button join-button--online" data-join="online" type="button">
+                  <img src="${DASHBOARD_ASSETS.onlineArena}" alt="" aria-hidden="true" />
+                  <span class="join-copy">
+                    <span>Online Arena</span>
+                    <b>FFA room</b>
+                  </span>
+                  <span class="button-arrow" aria-hidden="true">&gt;</span>
                 </button>
-                <button class="secondary join-button" data-join="bots" type="button">
-                  <span>Bot Arena</span>
-                  <b>Practice run</b>
+                <button class="join-button join-button--bots" data-join="bots" type="button">
+                  <img src="${DASHBOARD_ASSETS.botArena}" alt="" aria-hidden="true" />
+                  <span class="join-copy">
+                    <span>Bot Arena</span>
+                    <b>Practice run</b>
+                  </span>
+                  <span class="button-arrow" aria-hidden="true">&gt;</span>
                 </button>
               </div>
               <div class="menu-status" role="status">Ready</div>
+              <div class="landscape-strip" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
               <div class="quick-controls" aria-label="Combat controls">
-                <span>WASD</span>
-                <span>Mouse</span>
-                <span>E Auto</span>
-                <span>C Spin</span>
+                <span><i class="control-icon control-icon--dpad" aria-hidden="true"></i><b>WASD</b></span>
+                <span><i class="control-icon control-icon--mouse" aria-hidden="true"></i><b>Mouse</b></span>
+                <span><i class="control-icon control-icon--gear" aria-hidden="true"></i><b>E Auto</b></span>
+                <span><i class="control-icon control-icon--spin" aria-hidden="true"></i><b>C Spin</b></span>
               </div>
             </aside>
             <section class="arena-showcase lobby-panel" aria-label="Tank routes">
               <div class="panel-heading">
-                <span>Tank Routes</span>
+                <h2><span class="leaf-chip" aria-hidden="true"></span>Tank Routes<span class="leaf-chip leaf-chip--right" aria-hidden="true"></span></h2>
                 <strong>${TANK_CLASSES.length} classes</strong>
               </div>
-              <div class="tank-hero" aria-hidden="true">
-                <div class="preview-tank preview-tank--main">
-                  <span class="preview-barrel"></span>
-                  <span class="preview-body"></span>
+              <div class="route-map">
+                <img src="${DASHBOARD_ASSETS.routeMap}" alt="Cartoon meadow map showing tank upgrade routes" />
+                <div class="route-node route-node--tier2">
+                  <img src="${DASHBOARD_ASSETS.tankMachineGun}" alt="" aria-hidden="true" />
+                  <span>Tier 2</span>
                 </div>
-                <div class="preview-tank preview-tank--left">
-                  <span class="preview-barrel"></span>
-                  <span class="preview-body"></span>
+                <div class="route-node route-node--tier3">
+                  <img src="${DASHBOARD_ASSETS.tankSniper}" alt="" aria-hidden="true" />
+                  <span>Tier 3</span>
                 </div>
-                <div class="preview-tank preview-tank--right">
-                  <span class="preview-barrel"></span>
-                  <span class="preview-body"></span>
+                <div class="route-node route-node--tier4">
+                  <img src="${DASHBOARD_ASSETS.tankFlankGuard}" alt="" aria-hidden="true" />
+                  <span>Tier 4</span>
                 </div>
+                <button class="route-settings" type="button" aria-label="Route settings"><span></span></button>
               </div>
               <div class="upgrade-track">${renderUpgradeMilestones()}</div>
               <div class="starter-paths">${renderStarterPaths()}</div>
             </section>
             <aside class="progress-panel lobby-panel" aria-label="Saved profile">
-              <div class="panel-heading">
-                <span>Profile</span>
+              <div class="profile-titlebar">
+                <span class="star-chip" aria-hidden="true"></span>
+                <h2>Profile</h2>
+                <span class="star-chip" aria-hidden="true"></span>
+              </div>
+              <div class="profile-hero">
+                <div class="profile-avatar-wrap">
+                  <img src="${DASHBOARD_ASSETS.profileAvatar}" alt="Blue tank pilot profile avatar" />
+                  <span data-profile-level>1</span>
+                </div>
+                <div class="profile-strip"></div>
+              </div>
+              <div class="profile-name-row">
+                <span>Pilot profile</span>
                 <strong data-profile-name>Guest pilot</strong>
               </div>
-              <div class="profile-strip"></div>
               <div class="branch-meter">
                 <div>
                   <span>Custom branch</span>
                   <strong data-branch-value>0 / ${CUSTOM_BRANCH_UNLOCK_XP.toLocaleString()} XP</strong>
                 </div>
                 <div class="meter"><div data-branch-fill></div></div>
+                <small>0%</small>
               </div>
               <div class="badge-list"></div>
               <div class="tank-system">${renderTankSummary()}</div>
@@ -310,6 +369,7 @@ class HudController {
     this.joinButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-join]')];
     this.profileStrip = root.querySelector('.profile-strip') as HTMLDivElement;
     this.profileName = root.querySelector('[data-profile-name]') as HTMLElement;
+    this.profileLevel = root.querySelector('[data-profile-level]') as HTMLElement;
     this.menuStatus = root.querySelector('.menu-status') as HTMLDivElement;
     this.branchValue = root.querySelector('[data-branch-value]') as HTMLElement;
     this.branchFill = root.querySelector('[data-branch-fill]') as HTMLDivElement;
@@ -425,14 +485,16 @@ class HudController {
     const profileKey = `${profile?.displayName ?? 'Guest pilot'}|${profileXp}|${achievements.join(',')}|${branches.join(',')}`;
     if (profileKey === this.lastProfileKey) return;
     this.profileName.textContent = profile?.displayName ?? 'Guest pilot';
+    this.profileLevel.textContent = String(getProfileDisplayLevel(profileXp)).padStart(2, '0');
     this.profileStrip.innerHTML = `
-      <div class="profile-chip"><span>Profile XP</span><strong>${profileXp.toLocaleString()}</strong></div>
       <div class="profile-chip"><span>Badges</span><strong>${achievements.length}</strong></div>
       <div class="profile-chip"><span>Branches</span><strong>${branches.length}</strong></div>
     `;
     this.branchValue.textContent =
       branches.length > 0 ? 'Unlocked' : `${Math.min(profileXp, CUSTOM_BRANCH_UNLOCK_XP).toLocaleString()} / ${CUSTOM_BRANCH_UNLOCK_XP.toLocaleString()} XP`;
     this.branchFill.style.width = `${Math.round(branchProgress * 100)}%`;
+    const branchPercent = this.branchFill.closest('.branch-meter')?.querySelector('small');
+    if (branchPercent) branchPercent.textContent = `${Math.round(branchProgress * 100)}%`;
     this.badgeList.innerHTML = renderAchievementBadges(achievements);
     this.lastProfileKey = profileKey;
   }
@@ -823,10 +885,15 @@ class ArenaScene extends Phaser.Scene {
     const worldPointer = this.screenToWorld(pointer.x, pointer.y, cameraX, cameraY);
     const x = worldPointer.x - originX;
     const y = worldPointer.y - originY;
+    const distance = Math.hypot(x, y);
+    const angle = distance > 0.001 ? Math.atan2(y, x) : undefined;
+    // Send a unit vector because raw pixel deltas get axis-clamped by the server and skew shallow mouse angles.
+    const aimX = angle === undefined ? 0 : x / distance;
+    const aimY = angle === undefined ? 0 : y / distance;
     return {
-      x,
-      y,
-      angle: x * x + y * y > 0.001 ? Math.atan2(y, x) : undefined,
+      x: aimX,
+      y: aimY,
+      angle,
     };
   }
 
@@ -952,11 +1019,13 @@ function parseColor(value: string): number {
 }
 
 function renderLeaderboardRow(entry: LeaderboardEntry, index: number): string {
+  const tankClass = getTankClass(entry.tankId);
   return `
     <div class="leader-row">
-      <span>${index + 1}</span>
+      <span class="leader-rank">${index + 1}</span>
       <b>${escapeHtml(entry.name)}</b>
       <span>${entry.score.toLocaleString()}</span>
+      <small>${escapeHtml(tankClass.displayName)}</small>
     </div>
   `;
 }
@@ -966,11 +1035,15 @@ function renderUpgradeMilestones(): string {
     .map((level) => {
       const count = TANK_CLASSES.filter((tankClass) => tankClass.unlockLevel === level).length;
       const tier = level === 15 ? 'Tier 2' : level === 30 ? 'Tier 3' : 'Tier 4';
+      const className = level === 15 ? 'milestone--tier2' : level === 30 ? 'milestone--tier3' : 'milestone--tier4';
       return `
-        <div class="milestone">
-          <span>LV ${level}</span>
-          <strong>${tier}</strong>
-          <small>${count} picks</small>
+        <div class="milestone ${className}">
+          <div>
+            <span>LV ${level}</span>
+            <strong>${tier}</strong>
+            <small>${count} picks</small>
+          </div>
+          <span class="milestone-star" aria-hidden="true"></span>
         </div>
       `;
     })
@@ -980,9 +1053,13 @@ function renderUpgradeMilestones(): string {
 function renderStarterPaths(): string {
   return STARTER_PATHS.map((tankClass) => {
     const tags = tankClass.tags.slice(0, 2).map((tag) => tag.replace('-', ' ')).join(' / ');
+    const asset = STARTER_PATH_ASSETS[tankClass.id] ?? DASHBOARD_ASSETS.tankTwin;
+    const cardClass = `path-card--${tankClass.id.replace(/_/g, '-')}`;
     return `
-      <div class="path-card">
-        <span>${escapeHtml(tankClass.displayName)}</span>
+      <div class="path-card ${cardClass}">
+        <span class="path-card-corner" aria-hidden="true"></span>
+        <img src="${asset}" alt="${escapeHtml(tankClass.displayName)} tank class icon" />
+        <strong>${escapeHtml(tankClass.displayName)}</strong>
         <b>${escapeHtml(tags)}</b>
       </div>
     `;
@@ -994,20 +1071,24 @@ function renderTankSummary(): string {
   const autoCount = TANK_CLASSES.filter((tankClass) => tankClass.abilities.includes('auto-turret')).length;
   const droneCount = TANK_CLASSES.filter((tankClass) => tankClass.abilities.includes('drone-control')).length;
   return `
-    <div class="system-row"><span>Tank classes</span><strong>${TANK_CLASSES.length}</strong></div>
-    <div class="system-row"><span>Tier 4 picks</span><strong>${tierFourCount}</strong></div>
-    <div class="system-row"><span>Auto builds</span><strong>${autoCount}</strong></div>
-    <div class="system-row"><span>Drone builds</span><strong>${droneCount}</strong></div>
+    <div class="system-row system-row--classes"><span><i aria-hidden="true"></i>Tank classes</span><strong>${TANK_CLASSES.length}</strong></div>
+    <div class="system-row system-row--tier"><span><i aria-hidden="true"></i>Tier 4 picks</span><strong>${tierFourCount}</strong></div>
+    <div class="system-row system-row--auto"><span><i aria-hidden="true"></i>Auto builds</span><strong>${autoCount}</strong></div>
+    <div class="system-row system-row--drone"><span><i aria-hidden="true"></i>Drone builds</span><strong>${droneCount}</strong></div>
   `;
 }
 
 function renderAchievementBadges(achievementIds: string[]): string {
   if (achievementIds.length === 0) {
-    return '<div class="empty-badge">No badges yet</div>';
+    return '<div class="empty-badge"><span aria-hidden="true"></span><b>No badges yet</b></div>';
   }
   return achievementIds
-    .map((achievementId) => `<div class="badge-pill">${escapeHtml(ACHIEVEMENT_LABELS[achievementId] ?? achievementId)}</div>`)
+    .map((achievementId) => `<div class="badge-pill"><span aria-hidden="true"></span>${escapeHtml(ACHIEVEMENT_LABELS[achievementId] ?? achievementId)}</div>`)
     .join('');
+}
+
+function getProfileDisplayLevel(profileXp: number): number {
+  return Math.max(1, Math.min(99, Math.floor(profileXp / 180) + 1));
 }
 
 function escapeHtml(value: string): string {

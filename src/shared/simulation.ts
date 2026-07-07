@@ -229,11 +229,12 @@ export function removePlayer(room: GameRoom, playerId: string): MatchPlayer | un
 export function setPlayerInput(room: GameRoom, playerId: string, input: ClientInputPayload): void {
   const player = room.players.get(playerId);
   if (!player) return;
+  const aim = normalizeAimInput(input.aimX, input.aimY);
   player.input = {
     moveX: clamp(input.moveX, -1, 1),
     moveY: clamp(input.moveY, -1, 1),
-    aimX: clamp(input.aimX, -1, 1),
-    aimY: clamp(input.aimY, -1, 1),
+    aimX: aim.x,
+    aimY: aim.y,
     fire: input.fire,
     altFire: input.altFire,
     autoFire: input.autoFire,
@@ -419,7 +420,7 @@ function updatePlayer(room: GameRoom, player: MatchPlayer, dt: number, dtMs: num
   player.invulnerableMs = Math.max(0, player.invulnerableMs - dtMs);
   player.revealedMs = Math.max(0, player.revealedMs - dtMs);
 
-  if (player.input.autoSpin || tankClass.abilities.includes('auto-spin-friendly')) {
+  if (player.input.autoSpin) {
     player.aim += dt * 0.9;
   } else if (Math.hypot(player.input.aimX, player.input.aimY) > INPUT_DEADZONE) {
     player.aim = Math.atan2(player.input.aimY, player.input.aimX);
@@ -861,6 +862,17 @@ function nextId(room: GameRoom, prefix: string): string {
 
 function display(tankId: string): string {
   return TANK_CLASSES_BY_ID[tankId]?.displayName ?? tankId;
+}
+
+function normalizeAimInput(x: number, y: number): { x: number; y: number } {
+  const safeX = Number.isFinite(x) ? x : 0;
+  const safeY = Number.isFinite(y) ? y : 0;
+  const length = Math.hypot(safeX, safeY);
+  if (length <= INPUT_DEADZONE) return { x: 0, y: 0 };
+  return {
+    x: safeX / length,
+    y: safeY / length,
+  };
 }
 
 function clamp(value: number, min: number, max: number): number {
