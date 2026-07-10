@@ -44,6 +44,32 @@ export interface ProfileDto {
   customBranchUnlocks: string[];
 }
 
+export type CombatFeedbackKind =
+  | 'shot'
+  | 'projectile_shape'
+  | 'projectile_player'
+  | 'body_shape'
+  | 'body_player'
+  | 'shape_destroyed'
+  | 'player_destroyed';
+
+export type CombatFeedbackTargetKind = 'player' | 'shape';
+
+export interface CombatFeedbackEvent {
+  id: string;
+  kind: CombatFeedbackKind;
+  x: number;
+  y: number;
+  strength: number;
+  sourceId?: string;
+  targetId?: string;
+  targetKind?: CombatFeedbackTargetKind;
+  angle?: number;
+  xpGain?: number;
+  xpAfter?: number;
+  levelAfter?: number;
+}
+
 export interface SnapshotTank {
   id: string;
   name: string;
@@ -121,6 +147,7 @@ export interface GameSnapshot {
   projectiles: SnapshotProjectile[];
   shapes: SnapshotShape[];
   leaderboard: LeaderboardEntry[];
+  combatEvents: CombatFeedbackEvent[];
 }
 
 export type ServerMessage =

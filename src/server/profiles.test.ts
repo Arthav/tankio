@@ -27,6 +27,7 @@ describe('MemoryProfileStore', () => {
     expect(updated?.profile.profileXp).toBe(9000);
     expect(updated?.profile.achievements).toContain('first_destroy');
     expect(updated?.profile.achievements).toContain('score_2500');
+    expect(updated?.profile.achievements).toContain('deep_run');
     expect(updated?.profile.customBranchUnlocks).toContain('tankio.experimental.alpha');
   });
 });

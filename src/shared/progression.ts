@@ -21,6 +21,28 @@ export const DEFAULT_STATS: StatAllocation = {
   movementSpeed: 0,
 };
 
+export const STAT_GAINS: Record<StatKey, number> = {
+  healthRegen: 2.6,
+  maxHealth: 24,
+  bodyDamage: 10.5,
+  bulletSpeed: 0.09,
+  bulletPenetration: 0.14,
+  bulletDamage: 0.13,
+  reload: 0.13,
+  movementSpeed: 18,
+};
+
+export const STAT_GAIN_LABELS: Record<StatKey, string> = {
+  healthRegen: '+2.6/s',
+  maxHealth: '+24 HP',
+  bodyDamage: '+10.5 body',
+  bulletSpeed: '+9% speed',
+  bulletPenetration: '+14% pierce',
+  bulletDamage: '+13% dmg',
+  reload: '+13% fire',
+  movementSpeed: '+18 move',
+};
+
 export function xpRequiredForLevel(level: number): number {
   if (level <= 1) return 0;
   let total = 0;
@@ -103,14 +125,16 @@ export function deriveTankStats(tankId: string, level: number, stats: StatAlloca
   const rammerBonus = tankClass.tags.includes('rammer') ? 1.35 : 1;
   const spikeBonus = tankId === 'spike' ? 1.35 : 1;
   return {
-    maxHealth: 100 + level * 2.2 + stats.maxHealth * 18,
-    moveSpeed: (220 + stats.movementSpeed * 16 - Math.max(0, level - 1) * 0.8) * (tankClass.tags.includes('heavy') ? 0.92 : 1),
-    bodyDamage: (18 + stats.bodyDamage * 8) * rammerBonus * spikeBonus,
-    regenPerSecond: 1.8 + stats.healthRegen * 1.9,
-    reloadMultiplier: 1 / (1 + stats.reload * 0.105),
-    bulletSpeedMultiplier: 1 + stats.bulletSpeed * 0.075,
-    bulletDamageMultiplier: 1 + stats.bulletDamage * 0.105,
-    bulletPenetrationMultiplier: 1 + stats.bulletPenetration * 0.11,
+    maxHealth: 100 + level * 2.2 + stats.maxHealth * STAT_GAINS.maxHealth,
+    moveSpeed:
+      (220 + stats.movementSpeed * STAT_GAINS.movementSpeed - Math.max(0, level - 1) * 0.8) *
+      (tankClass.tags.includes('heavy') ? 0.92 : 1),
+    bodyDamage: (18 + stats.bodyDamage * STAT_GAINS.bodyDamage) * rammerBonus * spikeBonus,
+    regenPerSecond: 1.8 + stats.healthRegen * STAT_GAINS.healthRegen,
+    reloadMultiplier: 1 / (1 + stats.reload * STAT_GAINS.reload),
+    bulletSpeedMultiplier: 1 + stats.bulletSpeed * STAT_GAINS.bulletSpeed,
+    bulletDamageMultiplier: 1 + stats.bulletDamage * STAT_GAINS.bulletDamage,
+    bulletPenetrationMultiplier: 1 + stats.bulletPenetration * STAT_GAINS.bulletPenetration,
     radius: tankClass.bodyRadius ?? 24 + Math.min(8, level * 0.15),
     fovMultiplier: tankClass.fovMultiplier ?? 1,
   };

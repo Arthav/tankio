@@ -1,49 +1,83 @@
 import Phaser from 'phaser';
 import './styles.css';
-import botArenaUrl from './assets/dashboard/bot-arena.png';
-import logoMascotUrl from './assets/dashboard/logo-mascot.png';
-import onlineArenaUrl from './assets/dashboard/online-arena.png';
-import profileAvatarUrl from './assets/dashboard/profile-avatar.png';
-import routeMapUrl from './assets/dashboard/route-map.png';
-import tankFlankGuardUrl from './assets/dashboard/tank-flank-guard.png';
-import tankMachineGunUrl from './assets/dashboard/tank-machine-gun.png';
-import tankSniperUrl from './assets/dashboard/tank-sniper.png';
-import tankTwinUrl from './assets/dashboard/tank-twin.png';
+import botArenaUrl from './assets/dashboard/bot-arena-ui.jpg';
+import logoMascotUrl from './assets/dashboard/logo-mascot-ui.jpg';
+import onlineArenaUrl from './assets/dashboard/online-arena-ui.jpg';
+import profileAvatarUrl from './assets/dashboard/profile-avatar-ui.jpg';
+import routeMapUrl from './assets/dashboard/route-map-ui.jpg';
+import tankFlankGuardUrl from './assets/dashboard/tank-flank-guard-ui.jpg';
+import tankMachineGunUrl from './assets/dashboard/tank-machine-gun-ui.jpg';
+import tankSniperUrl from './assets/dashboard/tank-sniper-ui.jpg';
+import tankTwinUrl from './assets/dashboard/tank-twin-ui.jpg';
 import type {
   ClientInputPayload,
+  CombatFeedbackEvent,
   GameSnapshot,
   LeaderboardEntry,
-  ProfileDto,
-  ServerMessage,
-  SnapshotProjectile,
   SnapshotShape,
   SnapshotTank,
 } from '../shared/protocol';
+import { MAX_LEVEL, STAT_GAIN_LABELS, levelForXp, xpRequiredForLevel } from '../shared/progression';
+import { TANK_DEX_ENTRIES, getTankDexEntry, tankDexPowerKeys, type TankDexEntry, type TankPowerKey } from '../shared/tankDex';
 import { STAT_KEYS, type StatKey } from '../shared/tankTypes';
 import { getTankClass, TANK_CLASSES, TANK_CLASSES_BY_ID } from '../shared/tanks';
+import { clamp01, easeOutCubic, lerp } from './math';
+import { drawTankDexPreview as drawTankDexPreviewCanvas } from './tankDexPreview';
+import { TankioClient, TOKEN_KEY } from './tankioClient';
 
-const SERVER_HTTP = import.meta.env.VITE_SERVER_URL ?? `http://${location.hostname}:3001`;
-const SERVER_WS = SERVER_HTTP.replace(/^http/, 'ws');
-const TOKEN_KEY = 'tankio2.guestToken';
-const INTERPOLATION_DELAY_MS = 100;
-const MAX_SNAPSHOT_HISTORY = 8;
 const ENABLE_RENDER_DIAGNOSTICS =
   new URLSearchParams(location.search).has('debugRender') || localStorage.getItem('tankio2.debugRender') === '1';
-
-interface TimedSnapshot {
-  snapshot: GameSnapshot;
-  receivedAt: number;
-}
+const MAX_SEEN_COMBAT_EVENTS = 700;
+const MAX_IMPACT_PARTICLES = 280;
+const NEARBY_SHAKE_DISTANCE = 620;
 
 interface ClientInputState {
   autoFire: boolean;
   autoSpin: boolean;
 }
 
-interface GuestSession {
-  profile: ProfileDto;
-  token: string;
+interface ImpactParticle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  color: number;
+  lifeMs: number;
+  maxLifeMs: number;
 }
+
+interface ImpactRing {
+  x: number;
+  y: number;
+  color: number;
+  startRadius: number;
+  endRadius: number;
+  lineWidth: number;
+  lifeMs: number;
+  maxLifeMs: number;
+}
+
+type FlashTargetKind = 'player' | 'shape';
+
+interface TargetFlash {
+  targetKind: FlashTargetKind;
+  targetId: string;
+  color: number;
+  lifeMs: number;
+  maxLifeMs: number;
+}
+
+interface RewardFloat {
+  x: number;
+  y: number;
+  label: Phaser.GameObjects.Text;
+  lifeMs: number;
+  maxLifeMs: number;
+  strong: boolean;
+}
+
+type TankDexTierFilter = 'all' | '1' | '2' | '3' | '4';
 
 const CUSTOM_BRANCH_UNLOCK_XP = 8000;
 const STARTER_PATHS = TANK_CLASSES.filter((tankClass) => tankClass.unlockLevel === 15 && tankClass.parents.includes('basic'));
@@ -70,162 +104,21 @@ const ACHIEVEMENT_LABELS: Record<string, string> = {
   score_2500: 'Score 2.5k',
   deep_run: 'Deep Run',
 };
-
-class TankioClient {
-  snapshot?: GameSnapshot;
-  profile?: ProfileDto;
-  token?: string;
-  connected = false;
-  joined = false;
-  private socket?: WebSocket;
-  private connectionId = 0;
-  private readonly snapshotHistory: TimedSnapshot[] = [];
-
-  async hydrateSavedProfile(name: string): Promise<GuestSession | undefined> {
-    const existingToken = localStorage.getItem(TOKEN_KEY) ?? undefined;
-    if (!existingToken) return undefined;
-    return this.requestGuestProfile(name, existingToken);
-  }
-
-  async ensureGuestProfile(name: string): Promise<GuestSession> {
-    const existingToken = localStorage.getItem(TOKEN_KEY) ?? undefined;
-    return this.requestGuestProfile(name, existingToken);
-  }
-
-  async connect(name: string, mode: 'online' | 'bots'): Promise<void> {
-    const guest = await this.ensureGuestProfile(name);
-    this.disconnect();
-    const connectionId = this.connectionId;
-    this.joined = false;
-
-    await new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(`${SERVER_WS}/ws`);
-      this.socket = socket;
-      socket.addEventListener('open', () => {
-        if (!this.isCurrentSocket(socket, connectionId)) return;
-        this.connected = true;
-        this.send({ type: 'join', token: guest.token, name, mode });
-        resolve();
-      });
-      socket.addEventListener('message', (event) => {
-        if (this.isCurrentSocket(socket, connectionId)) this.handleMessage(event.data.toString());
-      });
-      socket.addEventListener('close', () => {
-        if (!this.isCurrentSocket(socket, connectionId)) return;
-        this.connected = false;
-        this.joined = false;
-        this.socket = undefined;
-      });
-      socket.addEventListener('error', () => {
-        if (this.isCurrentSocket(socket, connectionId)) reject(new Error('WebSocket connection failed.'));
-      });
-    });
-  }
-
-  disconnect(): void {
-    const socket = this.socket;
-    this.connectionId += 1;
-    this.socket = undefined;
-    this.connected = false;
-    this.joined = false;
-    this.snapshot = undefined;
-    this.snapshotHistory.length = 0;
-
-    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
-      socket.close(1000, 'Return to menu');
-    }
-  }
-
-  send(message: object): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify(message));
-  }
-
-  sendInput(input: ClientInputPayload): void {
-    if (!this.joined || this.snapshot?.self.alive === false) return;
-    this.send({ type: 'input', input });
-  }
-
-  retry(): void {
-    if (!this.joined) return;
-    this.send({ type: 'retry' });
-  }
-
-  upgradeStat(stat: StatKey): void {
-    this.send({ type: 'upgradeStat', stat });
-  }
-
-  upgradeTank(tankId: string): void {
-    this.send({ type: 'upgradeTank', tankId });
-  }
-
-  getRenderSnapshot(now = performance.now()): GameSnapshot | undefined {
-    if (this.snapshotHistory.length < 2) return this.snapshot;
-
-    const targetTime = now - INTERPOLATION_DELAY_MS;
-    let previous = this.snapshotHistory[0];
-    let next = this.snapshotHistory[this.snapshotHistory.length - 1];
-
-    for (let index = 0; index < this.snapshotHistory.length - 1; index += 1) {
-      const left = this.snapshotHistory[index];
-      const right = this.snapshotHistory[index + 1];
-      if (left.receivedAt <= targetTime && targetTime <= right.receivedAt) {
-        previous = left;
-        next = right;
-        break;
-      }
-    }
-
-    if (targetTime <= this.snapshotHistory[0].receivedAt) {
-      return this.snapshotHistory[0].snapshot;
-    }
-
-    if (targetTime >= next.receivedAt) {
-      return next.snapshot;
-    }
-
-    const alpha = clamp01((targetTime - previous.receivedAt) / Math.max(1, next.receivedAt - previous.receivedAt));
-    return interpolateSnapshots(previous.snapshot, next.snapshot, alpha);
-  }
-
-  private handleMessage(raw: string): void {
-    const message = JSON.parse(raw) as ServerMessage;
-    if (message.type === 'snapshot') {
-      this.snapshot = message;
-      this.snapshotHistory.push({ snapshot: message, receivedAt: performance.now() });
-      if (this.snapshotHistory.length > MAX_SNAPSHOT_HISTORY) this.snapshotHistory.shift();
-      return;
-    }
-    if (message.type === 'welcome' || message.type === 'profile') {
-      if (message.type === 'welcome') this.joined = true;
-      this.profile = message.profile;
-      this.token = message.token;
-      localStorage.setItem(TOKEN_KEY, message.token);
-      return;
-    }
-    if (message.type === 'error') {
-      console.error(message.message);
-    }
-  }
-
-  private isCurrentSocket(socket: WebSocket, connectionId: number): boolean {
-    return this.socket === socket && this.connectionId === connectionId;
-  }
-
-  private async requestGuestProfile(name: string, token?: string): Promise<GuestSession> {
-    const response = await fetch(`${SERVER_HTTP}/api/guest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, name }),
-    });
-    if (!response.ok) throw new Error(`Guest profile request failed with ${response.status}.`);
-    const guest = (await response.json()) as GuestSession;
-    this.profile = guest.profile;
-    this.token = guest.token;
-    localStorage.setItem(TOKEN_KEY, guest.token);
-    return guest;
-  }
-}
+const TANK_DEX_TIER_FILTERS: { value: TankDexTierFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: '1', label: 'T1' },
+  { value: '2', label: 'T2' },
+  { value: '3', label: 'T3' },
+  { value: '4', label: 'T4' },
+];
+const TANK_DEX_POWER_LABELS: Record<TankPowerKey, string> = {
+  damage: 'Damage',
+  fireRate: 'Fire Rate',
+  range: 'Range',
+  mobility: 'Mobility',
+  survivability: 'Survival',
+  utility: 'Utility',
+};
 
 class HudController {
   private readonly menu: HTMLDivElement;
@@ -236,6 +129,13 @@ class HudController {
   private readonly profileName: HTMLElement;
   private readonly profileLevel: HTMLElement;
   private readonly menuStatus: HTMLDivElement;
+  private readonly routeSettingsButton: HTMLButtonElement;
+  private readonly tankDexModal: HTMLElement;
+  private readonly tankDexSearch: HTMLInputElement;
+  private readonly tankDexTierButtons: HTMLButtonElement[];
+  private readonly tankDexList: HTMLElement;
+  private readonly tankDexDetail: HTMLElement;
+  private readonly tankDexPreview: HTMLCanvasElement;
   private readonly branchValue: HTMLElement;
   private readonly branchFill: HTMLDivElement;
   private readonly badgeList: HTMLDivElement;
@@ -251,6 +151,9 @@ class HudController {
   private readonly score: HTMLDivElement;
   private readonly level: HTMLDivElement;
   private readonly healthFill: HTMLDivElement;
+  private readonly xpText: HTMLElement;
+  private readonly xpNeed: HTMLElement;
+  private readonly xpFill: HTMLDivElement;
   private readonly deathScore: HTMLElement;
   private readonly deathXp: HTMLElement;
   private readonly deathRetryButton: HTMLButtonElement;
@@ -262,6 +165,10 @@ class HudController {
   private lastLeaderboardKey = '';
   private lastDeathKey = '';
   private lastAutoFire?: boolean;
+  private tankDexOpen = false;
+  private selectedTankDexId = 'basic';
+  private tankDexTierFilter: TankDexTierFilter = 'all';
+  private tankDexAnimationFrame?: number;
 
   constructor(
     private readonly client: TankioClient,
@@ -275,7 +182,7 @@ class HudController {
           <div class="lobby-grid">
             <aside class="play-dock lobby-panel">
               <div class="brand-lockup">
-                <img class="brand-mascot" src="${DASHBOARD_ASSETS.logoMascot}" alt="Blue Tankio2 tank mascot" />
+                <img class="brand-mascot" src="${DASHBOARD_ASSETS.logoMascot}" width="192" height="192" decoding="async" alt="Blue Tankio2 tank mascot" />
                 <h1>TANKIO2</h1>
               </div>
               <div class="mode-ribbon" aria-label="Selected arena mode">
@@ -292,7 +199,7 @@ class HudController {
               </div>
               <div class="menu-actions">
                 <button class="join-button join-button--online" data-join="online" type="button">
-                  <img src="${DASHBOARD_ASSETS.onlineArena}" alt="" aria-hidden="true" />
+                  <img src="${DASHBOARD_ASSETS.onlineArena}" width="136" height="136" decoding="async" alt="" aria-hidden="true" />
                   <span class="join-copy">
                     <span>Online Arena</span>
                     <b>FFA room</b>
@@ -300,7 +207,7 @@ class HudController {
                   <span class="button-arrow" aria-hidden="true">&gt;</span>
                 </button>
                 <button class="join-button join-button--bots" data-join="bots" type="button">
-                  <img src="${DASHBOARD_ASSETS.botArena}" alt="" aria-hidden="true" />
+                  <img src="${DASHBOARD_ASSETS.botArena}" width="136" height="136" decoding="async" alt="" aria-hidden="true" />
                   <span class="join-copy">
                     <span>Bot Arena</span>
                     <b>Practice run</b>
@@ -327,20 +234,20 @@ class HudController {
                 <strong>${TANK_CLASSES.length} classes</strong>
               </div>
               <div class="route-map">
-                <img src="${DASHBOARD_ASSETS.routeMap}" alt="Cartoon meadow map showing tank upgrade routes" />
+                <img src="${DASHBOARD_ASSETS.routeMap}" width="1024" height="683" decoding="async" fetchpriority="high" alt="Cartoon meadow map showing tank upgrade routes" />
                 <div class="route-node route-node--tier2">
-                  <img src="${DASHBOARD_ASSETS.tankMachineGun}" alt="" aria-hidden="true" />
+                  <img src="${DASHBOARD_ASSETS.tankMachineGun}" width="224" height="224" loading="lazy" decoding="async" alt="" aria-hidden="true" />
                   <span>Tier 2</span>
                 </div>
                 <div class="route-node route-node--tier3">
-                  <img src="${DASHBOARD_ASSETS.tankSniper}" alt="" aria-hidden="true" />
+                  <img src="${DASHBOARD_ASSETS.tankSniper}" width="224" height="168" loading="lazy" decoding="async" alt="" aria-hidden="true" />
                   <span>Tier 3</span>
                 </div>
                 <div class="route-node route-node--tier4">
-                  <img src="${DASHBOARD_ASSETS.tankFlankGuard}" alt="" aria-hidden="true" />
+                  <img src="${DASHBOARD_ASSETS.tankFlankGuard}" width="224" height="179" loading="lazy" decoding="async" alt="" aria-hidden="true" />
                   <span>Tier 4</span>
                 </div>
-                <button class="route-settings" type="button" aria-label="Route settings"><span></span></button>
+                <button class="route-settings" type="button" aria-label="Open Tank Dex"><span></span></button>
               </div>
               <div class="upgrade-track">${renderUpgradeMilestones()}</div>
               <div class="starter-paths">${renderStarterPaths()}</div>
@@ -353,7 +260,7 @@ class HudController {
               </div>
               <div class="profile-hero">
                 <div class="profile-avatar-wrap">
-                  <img src="${DASHBOARD_ASSETS.profileAvatar}" alt="Blue tank pilot profile avatar" />
+                  <img src="${DASHBOARD_ASSETS.profileAvatar}" width="208" height="208" decoding="async" alt="Blue tank pilot profile avatar" />
                   <span data-profile-level>1</span>
                 </div>
                 <div class="profile-strip"></div>
@@ -375,6 +282,37 @@ class HudController {
             </aside>
           </div>
         </section>
+        <section class="tank-dex-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="tank-dex-title">
+          <button class="tank-dex-backdrop" type="button" data-tank-dex-close aria-label="Close Tank Dex"></button>
+          <div class="tank-dex-shell">
+            <header class="tank-dex-header">
+              <div>
+                <span>Tank Dex</span>
+                <h2 id="tank-dex-title">Tank Dex</h2>
+              </div>
+              <button class="tank-dex-close" type="button" data-tank-dex-close>Close</button>
+            </header>
+            <div class="tank-dex-tools">
+              <label class="tank-dex-search-wrap">
+                <span>Search</span>
+                <input class="tank-dex-search" type="search" placeholder="Search tank, role, trait" autocomplete="off" />
+              </label>
+              <div class="tank-dex-tabs" role="tablist" aria-label="Tank tier filter">
+                ${TANK_DEX_TIER_FILTERS.map(
+                  (filter) =>
+                    `<button class="tank-dex-tab${filter.value === 'all' ? ' active' : ''}" type="button" data-dex-tier="${filter.value}" aria-pressed="${filter.value === 'all'}">${filter.label}</button>`,
+                ).join('')}
+              </div>
+            </div>
+            <div class="tank-dex-body">
+              <nav class="tank-dex-list" aria-label="Available tanks"></nav>
+              <article class="tank-dex-detail" aria-live="polite">
+                <canvas class="tank-dex-preview" width="720" height="360" aria-label="Selected tank animation preview"></canvas>
+                <div class="tank-dex-detail-content"></div>
+              </article>
+            </div>
+          </div>
+        </section>
         <section class="hud">
           <div class="status">
             <div class="status-top">
@@ -384,7 +322,14 @@ class HudController {
               </div>
               <div class="level-pill"></div>
             </div>
-            <div class="bar"><div class="bar-fill"></div></div>
+            <div class="bar health-bar"><div class="bar-fill"></div></div>
+            <div class="xp-meter">
+              <div class="xp-line">
+                <span data-xp-text>0 / 0 XP</span>
+                <strong data-xp-need>Need 0 XP</strong>
+              </div>
+              <div class="xp-track"><div data-xp-fill></div></div>
+            </div>
           </div>
           <div class="leaderboard"></div>
           <div class="combat-panel">
@@ -419,6 +364,13 @@ class HudController {
     this.profileName = root.querySelector('[data-profile-name]') as HTMLElement;
     this.profileLevel = root.querySelector('[data-profile-level]') as HTMLElement;
     this.menuStatus = root.querySelector('.menu-status') as HTMLDivElement;
+    this.routeSettingsButton = root.querySelector('.route-settings') as HTMLButtonElement;
+    this.tankDexModal = root.querySelector('.tank-dex-modal') as HTMLElement;
+    this.tankDexSearch = root.querySelector('.tank-dex-search') as HTMLInputElement;
+    this.tankDexTierButtons = [...root.querySelectorAll<HTMLButtonElement>('[data-dex-tier]')];
+    this.tankDexList = root.querySelector('.tank-dex-list') as HTMLElement;
+    this.tankDexDetail = root.querySelector('.tank-dex-detail-content') as HTMLElement;
+    this.tankDexPreview = root.querySelector('.tank-dex-preview') as HTMLCanvasElement;
     this.branchValue = root.querySelector('[data-branch-value]') as HTMLElement;
     this.branchFill = root.querySelector('[data-branch-fill]') as HTMLDivElement;
     this.badgeList = root.querySelector('.badge-list') as HTMLDivElement;
@@ -434,6 +386,9 @@ class HudController {
     this.score = this.status.querySelector('.score-line') as HTMLDivElement;
     this.level = this.status.querySelector('.level-pill') as HTMLDivElement;
     this.healthFill = this.status.querySelector('.bar-fill') as HTMLDivElement;
+    this.xpText = this.status.querySelector('[data-xp-text]') as HTMLElement;
+    this.xpNeed = this.status.querySelector('[data-xp-need]') as HTMLElement;
+    this.xpFill = this.status.querySelector('[data-xp-fill]') as HTMLDivElement;
     this.deathScore = this.death.querySelector('[data-death-score]') as HTMLElement;
     this.deathXp = this.death.querySelector('[data-death-xp]') as HTMLElement;
     this.deathRetryButton = this.death.querySelector('[data-death-retry]') as HTMLButtonElement;
@@ -450,6 +405,36 @@ class HudController {
       this.inputState.autoFire = !this.inputState.autoFire;
       this.renderCombatControls();
     });
+
+    this.routeSettingsButton.addEventListener('click', () => {
+      this.openTankDex();
+    });
+
+    this.tankDexModal.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement;
+      if (target.closest('[data-tank-dex-close]')) {
+        this.closeTankDex();
+        return;
+      }
+
+      const tierButton = target.closest<HTMLButtonElement>('[data-dex-tier]');
+      if (tierButton) {
+        this.tankDexTierFilter = (tierButton.dataset.dexTier ?? 'all') as TankDexTierFilter;
+        this.renderTankDex();
+        return;
+      }
+
+      const tankButton = target.closest<HTMLButtonElement>('[data-dex-tank]');
+      if (tankButton?.dataset.dexTank) {
+        this.selectTankDexEntry(tankButton.dataset.dexTank);
+      }
+    });
+
+    this.tankDexSearch.addEventListener('input', () => {
+      this.renderTankDex();
+    });
+
+    window.addEventListener('keydown', (event) => this.handleGlobalKeyDown(event));
 
     this.deathRetryButton.addEventListener('click', () => {
       this.client.retry();
@@ -472,6 +457,7 @@ class HudController {
     });
 
     this.renderProfile();
+    this.renderTankDex();
     void this.hydrateSavedProfile();
   }
 
@@ -485,23 +471,30 @@ class HudController {
     const player = snapshot.players.find((candidate) => candidate.id === snapshot.selfId);
     const healthRatio = player ? Math.max(0, player.health / player.maxHealth) : 0;
     const healthPercent = Math.round(healthRatio * 100);
+    const xpProgress = getLevelProgress(self.xp, self.level);
 
-    const statusKey = `${tankClass.displayName}|${self.level}|${self.score}|${healthPercent}`;
+    const statusKey = `${tankClass.displayName}|${self.level}|${self.score}|${self.xp}|${healthPercent}`;
     if (statusKey !== this.lastStatusKey) {
       this.className.textContent = tankClass.displayName;
       this.score.textContent = `${self.score.toLocaleString()} score`;
       this.level.textContent = `LV ${self.level}`;
       this.healthFill.style.width = `${healthPercent}%`;
+      this.xpText.textContent = xpProgress.isMaxLevel
+        ? `${xpProgress.currentXp.toLocaleString()} XP`
+        : `${xpProgress.currentXp.toLocaleString()} / ${xpProgress.nextXp.toLocaleString()} XP`;
+      this.xpNeed.textContent = xpProgress.isMaxLevel ? 'MAX LEVEL' : `Need ${xpProgress.neededXp.toLocaleString()} XP`;
+      this.xpFill.style.width = `${Math.round(xpProgress.progress * 100)}%`;
       this.lastStatusKey = statusKey;
     }
 
     const statsKey = `${STAT_KEYS.map((stat) => `${stat}:${self.stats[stat]}`).join('|')}|points:${self.availableStatPoints}`;
     if (statsKey !== this.lastStatsKey) {
-      this.stats.innerHTML = STAT_KEYS.map((stat) => {
+      this.stats.innerHTML = STAT_KEYS.map((stat, index) => {
         const label = statLabels[stat];
         const value = self.stats[stat];
+        const gain = STAT_GAIN_LABELS[stat];
         const disabled = self.availableStatPoints <= 0 ? 'disabled' : '';
-        return `<button class="stat-button" data-stat="${stat}" ${disabled}><b>${label}</b><span>${value} / +</span></button>`;
+        return `<button class="stat-button" data-stat="${stat}" ${disabled}><span class="stat-hotkey" aria-hidden="true">${index + 1}</span><b>${label}</b><span class="stat-value">${value} | ${gain}</span></button>`;
       }).join('');
       this.lastStatsKey = statsKey;
     }
@@ -533,6 +526,149 @@ class HudController {
       this.deathXp.textContent = self.sessionXp.toLocaleString();
       this.lastDeathKey = deathKey;
     }
+  }
+
+  private openTankDex(): void {
+    if (this.tankDexOpen) return;
+    this.tankDexOpen = true;
+    this.tankDexModal.classList.add('is-open');
+    this.tankDexModal.setAttribute('aria-hidden', 'false');
+    this.renderTankDex();
+    this.startTankDexPreview();
+    this.tankDexSearch.focus();
+  }
+
+  private closeTankDex(): void {
+    if (!this.tankDexOpen) return;
+    this.tankDexOpen = false;
+    this.tankDexModal.classList.remove('is-open');
+    this.tankDexModal.setAttribute('aria-hidden', 'true');
+    this.stopTankDexPreview();
+    this.routeSettingsButton.focus();
+  }
+
+  private renderTankDex(): void {
+    const entries = this.filteredTankDexEntries();
+    if (!entries.some((entry) => entry.tank.id === this.selectedTankDexId)) {
+      this.selectedTankDexId = entries[0]?.tank.id ?? 'basic';
+    }
+
+    for (const button of this.tankDexTierButtons) {
+      const isActive = button.dataset.dexTier === this.tankDexTierFilter;
+      button.classList.toggle('active', isActive);
+      button.setAttribute('aria-pressed', String(isActive));
+    }
+
+    this.tankDexList.innerHTML =
+      entries.length === 0
+        ? '<div class="tank-dex-empty">No tanks found</div>'
+        : entries
+            .map((entry) => {
+              const isActive = entry.tank.id === this.selectedTankDexId;
+              return `
+                <button class="tank-dex-card${isActive ? ' active' : ''}" type="button" data-dex-tank="${entry.tank.id}" aria-pressed="${isActive}">
+                  <span>Tier ${entry.tank.tier}</span>
+                  <strong>${escapeHtml(entry.tank.displayName)}</strong>
+                  <small>${escapeHtml(entry.metadata.role)}</small>
+                  <b>${escapeHtml(renderTankDexRequirementShort(entry))}</b>
+                </button>
+              `;
+            })
+            .join('');
+
+    this.renderTankDexDetail(getTankDexEntry(this.selectedTankDexId));
+  }
+
+  private filteredTankDexEntries(): TankDexEntry[] {
+    const tier = this.tankDexTierFilter;
+    const term = this.tankDexSearch.value.trim().toLowerCase();
+    return TANK_DEX_ENTRIES.filter((entry) => {
+      if (tier !== 'all' && entry.tank.tier !== Number(tier)) return false;
+      if (!term) return true;
+      const searchable = [
+        entry.tank.id,
+        entry.tank.displayName,
+        entry.metadata.role,
+        entry.metadata.description,
+        entry.metadata.playstyle,
+        entry.weaponSummary,
+        entry.statCapSummary,
+        ...entry.traits,
+        ...entry.abilityLabels,
+      ]
+        .join(' ')
+        .toLowerCase();
+      return searchable.includes(term);
+    });
+  }
+
+  private selectTankDexEntry(tankId: string): void {
+    this.selectedTankDexId = tankId;
+    this.renderTankDex();
+  }
+
+  private renderTankDexDetail(entry: TankDexEntry): void {
+    const abilities = entry.abilityLabels.length > 0 ? entry.abilityLabels : ['No Special Ability'];
+    const parentNames = entry.tank.parents.length > 0 ? entry.tank.parents.map((parentId) => getTankClass(parentId).displayName).join(', ') : 'Starter';
+    this.tankDexDetail.innerHTML = `
+      <div class="tank-dex-title-row">
+        <div>
+          <span>Tier ${entry.tank.tier} - ${escapeHtml(entry.metadata.role)}</span>
+          <h3>${escapeHtml(entry.tank.displayName)}</h3>
+        </div>
+        <strong>${escapeHtml(renderTankDexRequirementShort(entry))}</strong>
+      </div>
+      <p class="tank-dex-description">${escapeHtml(entry.metadata.description)}</p>
+      <p class="tank-dex-playstyle">${escapeHtml(entry.metadata.playstyle)}</p>
+      <div class="tank-dex-power-grid">
+        ${tankDexPowerKeys()
+          .map(
+            (key) => `
+              <div class="tank-dex-power-row">
+                <span>${TANK_DEX_POWER_LABELS[key]}</span>
+                <div class="tank-dex-power-track"><div style="width: ${entry.power[key]}%"></div></div>
+                <b>${entry.power[key]}</b>
+              </div>
+            `,
+          )
+          .join('')}
+      </div>
+      <div class="tank-dex-chip-group" aria-label="Tank abilities">
+        ${abilities.map((ability) => `<span class="tank-dex-chip tank-dex-chip--ability">${escapeHtml(ability)}</span>`).join('')}
+      </div>
+      <div class="tank-dex-chip-group" aria-label="Tank traits">
+        ${entry.traits.map((trait) => `<span class="tank-dex-chip">${escapeHtml(trait)}</span>`).join('')}
+      </div>
+      <div class="tank-dex-facts">
+        <span><b>Weapons</b>${escapeHtml(entry.weaponSummary)}</span>
+        <span><b>Parents</b>${escapeHtml(parentNames)}</span>
+        <span><b>Stats</b>${escapeHtml(entry.statCapSummary)}</span>
+      </div>
+      <div class="tank-dex-paths">
+        <h4>Requirements</h4>
+        ${entry.paths.map((path) => renderTankDexPath(path)).join('')}
+      </div>
+    `;
+  }
+
+  private startTankDexPreview(): void {
+    this.stopTankDexPreview();
+    const animate = (now: number) => {
+      this.drawTankDexPreview(now);
+      if (this.tankDexOpen) this.tankDexAnimationFrame = requestAnimationFrame(animate);
+    };
+    this.tankDexAnimationFrame = requestAnimationFrame(animate);
+  }
+
+  private stopTankDexPreview(): void {
+    if (this.tankDexAnimationFrame !== undefined) {
+      cancelAnimationFrame(this.tankDexAnimationFrame);
+      this.tankDexAnimationFrame = undefined;
+    }
+  }
+
+  private drawTankDexPreview(now: number): void {
+    drawTankDexPreviewCanvas(this.tankDexPreview, this.selectedTankDexId, now);
   }
 
   private renderProfile(): void {
@@ -624,6 +760,22 @@ class HudController {
     this.autoFireState.textContent = this.inputState.autoFire ? 'On' : 'Off';
     this.lastAutoFire = this.inputState.autoFire;
   }
+
+  private handleGlobalKeyDown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && this.tankDexOpen) {
+      this.closeTankDex();
+      return;
+    }
+
+    const stat = statKeyForHotkey(event);
+    if (!stat || event.repeat || isTypingTarget(event.target)) return;
+
+    const snapshot = this.client.snapshot;
+    if (!this.client.joined || !snapshot || !snapshot.self.alive || snapshot.self.availableStatPoints <= 0) return;
+
+    event.preventDefault();
+    this.client.upgradeStat(stat);
+  }
 }
 
 class ArenaScene extends Phaser.Scene {
@@ -637,6 +789,14 @@ class ArenaScene extends Phaser.Scene {
   private diagnosticsElement?: HTMLDivElement;
   private readonly frameDeltas: number[] = [];
   private lastDiagnosticsUpdate = 0;
+  private readonly seenCombatEventIds = new Set<string>();
+  private readonly seenCombatEventOrder: string[] = [];
+  private readonly impactParticles: ImpactParticle[] = [];
+  private readonly impactRings: ImpactRing[] = [];
+  private readonly targetFlashes = new Map<string, TargetFlash>();
+  private readonly rewardFloats: RewardFloat[] = [];
+  private lastCombatRoomId = '';
+  private shakeTrauma = 0;
 
   constructor(
     private readonly client: TankioClient,
@@ -676,10 +836,11 @@ class ArenaScene extends Phaser.Scene {
     this.updateDiagnostics(delta);
     this.hud.update();
     if (!this.client.joined) {
+      this.clearCombatVisuals();
       this.renderMenuBackdrop(time);
       return;
     }
-    this.renderWorld();
+    this.renderWorld(delta);
     const snapshot = this.client.getRenderSnapshot();
     if (snapshot?.self.alive === false) {
       this.fire = false;
@@ -761,7 +922,7 @@ class ArenaScene extends Phaser.Scene {
     this.hideUnusedNameLabels();
   }
 
-  private renderWorld(): void {
+  private renderWorld(delta: number): void {
     const snapshot = this.client.getRenderSnapshot();
     const width = this.scale.width;
     const height = this.scale.height;
@@ -770,8 +931,12 @@ class ArenaScene extends Phaser.Scene {
     this.graphics.fillStyle(0x0b1116, 1);
     this.graphics.fillRect(0, 0, width, height);
     const self = snapshot?.players.find((player) => player.id === snapshot.selfId);
-    const cameraX = self?.x ?? (snapshot ? snapshot.world.width / 2 : 2100);
-    const cameraY = self?.y ?? (snapshot ? snapshot.world.height / 2 : 2100);
+    if (snapshot) this.ingestCombatEvents(snapshot, self);
+    const baseCameraX = self?.x ?? (snapshot ? snapshot.world.width / 2 : 2100);
+    const baseCameraY = self?.y ?? (snapshot ? snapshot.world.height / 2 : 2100);
+    const shakeOffset = this.getCameraShakeOffset(delta);
+    const cameraX = baseCameraX + shakeOffset.x;
+    const cameraY = baseCameraY + shakeOffset.y;
     const localAim = self ? this.getPointerAim(self.x, self.y, cameraX, cameraY).angle ?? self.aim : undefined;
     this.drawGrid(cameraX, cameraY);
     if (!snapshot) {
@@ -780,17 +945,7 @@ class ArenaScene extends Phaser.Scene {
     }
 
     for (const shape of snapshot.shapes) {
-      const point = this.worldToScreen(shape.x, shape.y, cameraX, cameraY);
-      const color = shape.shape === 'square' ? 0xffe45c : shape.shape === 'triangle' ? 0xff6b7a : shape.shape === 'pentagon' ? 0x5f8cff : 0x8f6bff;
-      this.graphics.lineStyle(4, 0x172530, 1);
-      this.graphics.fillStyle(color, 0.94);
-      if (shape.shape === 'square') {
-        this.drawRegularPolygon(point.x, point.y, shape.radius, 4, shape.rotation + Math.PI / 4);
-      } else if (shape.shape === 'triangle') {
-        this.drawRegularPolygon(point.x, point.y, shape.radius, 3, shape.rotation);
-      } else {
-        this.drawRegularPolygon(point.x, point.y, shape.radius, 5, shape.rotation);
-      }
+      this.drawShape(shape, cameraX, cameraY);
     }
 
     for (const projectile of snapshot.projectiles) {
@@ -812,7 +967,33 @@ class ArenaScene extends Phaser.Scene {
       const isSelf = player.id === snapshot.selfId;
       this.drawTank(player, cameraX, cameraY, isSelf, isSelf ? localAim : undefined);
     }
+    this.drawCombatEffects(cameraX, cameraY, delta);
     this.hideUnusedNameLabels();
+  }
+
+  private drawShape(shape: SnapshotShape, cameraX: number, cameraY: number): void {
+    const point = this.worldToScreen(shape.x, shape.y, cameraX, cameraY);
+    const color = shape.shape === 'square' ? 0xffe45c : shape.shape === 'triangle' ? 0xff6b7a : shape.shape === 'pentagon' ? 0x5f8cff : 0x8f6bff;
+    this.graphics.lineStyle(4, 0x172530, 1);
+    this.graphics.fillStyle(color, 0.94);
+    this.drawShapePolygon(shape, point.x, point.y);
+
+    const flash = this.getTargetFlash('shape', shape.id);
+    if (!flash) return;
+    const alpha = this.flashAlpha(flash);
+    this.graphics.fillStyle(flash.color, 0.18 * alpha);
+    this.graphics.lineStyle(5, flash.color, 0.85 * alpha);
+    this.drawShapePolygon(shape, point.x, point.y);
+  }
+
+  private drawShapePolygon(shape: SnapshotShape, x: number, y: number): void {
+    if (shape.shape === 'square') {
+      this.drawRegularPolygon(x, y, shape.radius, 4, shape.rotation + Math.PI / 4);
+    } else if (shape.shape === 'triangle') {
+      this.drawRegularPolygon(x, y, shape.radius, 3, shape.rotation);
+    } else {
+      this.drawRegularPolygon(x, y, shape.radius, 5, shape.rotation);
+    }
   }
 
   private drawTank(player: SnapshotTank, cameraX: number, cameraY: number, isSelf: boolean, aimOverride?: number): void {
@@ -838,15 +1019,14 @@ class ArenaScene extends Phaser.Scene {
 
     this.graphics.fillStyle(bodyColor, 1);
     this.graphics.lineStyle(isSelf ? 5 : 4, outline, 1);
-    if (tankClass.bodyShape === 'square') {
-      this.drawRegularPolygon(point.x, point.y, player.radius, 4, Math.PI / 4);
-    } else if (tankClass.bodyShape === 'spiked') {
-      this.drawSpiked(point.x, point.y, player.radius);
-    } else if (tankClass.bodyShape === 'hex') {
-      this.drawRegularPolygon(point.x, point.y, player.radius, 6, aim);
-    } else {
-      this.graphics.fillCircle(point.x, point.y, player.radius);
-      this.graphics.strokeCircle(point.x, point.y, player.radius);
+    this.drawTankBodyShape(tankClass.bodyShape, point.x, point.y, player.radius, aim);
+
+    const flash = this.getTargetFlash('player', player.id);
+    if (flash) {
+      const alpha = this.flashAlpha(flash);
+      this.graphics.fillStyle(flash.color, 0.16 * alpha);
+      this.graphics.lineStyle(isSelf ? 7 : 6, flash.color, 0.82 * alpha);
+      this.drawTankBodyShape(tankClass.bodyShape, point.x, point.y, player.radius + 1.5, aim);
     }
 
     const healthWidth = 54;
@@ -855,6 +1035,19 @@ class ArenaScene extends Phaser.Scene {
     this.graphics.fillStyle(isSelf ? 0x35d0ff : 0xff6b7a, 0.95);
     this.graphics.fillRect(point.x - healthWidth / 2, point.y + player.radius + 10, healthWidth * Math.max(0, player.health / player.maxHealth), 6);
     this.addNameLabel(point.x, point.y - player.radius - 20, player.name);
+  }
+
+  private drawTankBodyShape(bodyShape: ReturnType<typeof getTankClass>['bodyShape'], x: number, y: number, radius: number, aim: number): void {
+    if (bodyShape === 'square') {
+      this.drawRegularPolygon(x, y, radius, 4, Math.PI / 4);
+    } else if (bodyShape === 'spiked') {
+      this.drawSpiked(x, y, radius);
+    } else if (bodyShape === 'hex') {
+      this.drawRegularPolygon(x, y, radius, 6, aim);
+    } else {
+      this.graphics.fillCircle(x, y, radius);
+      this.graphics.strokeCircle(x, y, radius);
+    }
   }
 
   private addNameLabel(x: number, y: number, name: string): void {
@@ -883,6 +1076,291 @@ class ArenaScene extends Phaser.Scene {
     for (let index = this.activeNameLabelIndex; index < this.nameLabels.length; index += 1) {
       this.nameLabels[index].setVisible(false);
     }
+  }
+
+  private ingestCombatEvents(snapshot: GameSnapshot, self: SnapshotTank | undefined): void {
+    if (this.lastCombatRoomId !== snapshot.roomId) {
+      this.clearCombatVisuals();
+      this.lastCombatRoomId = snapshot.roomId;
+    }
+
+    for (const event of snapshot.combatEvents) {
+      if (this.seenCombatEventIds.has(event.id)) continue;
+      this.rememberCombatEventId(event.id);
+      this.spawnCombatEffect(event, snapshot, self);
+    }
+  }
+
+  private rememberCombatEventId(id: string): void {
+    this.seenCombatEventIds.add(id);
+    this.seenCombatEventOrder.push(id);
+    while (this.seenCombatEventOrder.length > MAX_SEEN_COMBAT_EVENTS) {
+      const staleId = this.seenCombatEventOrder.shift();
+      if (staleId) this.seenCombatEventIds.delete(staleId);
+    }
+  }
+
+  private spawnCombatEffect(event: CombatFeedbackEvent, snapshot: GameSnapshot, self: SnapshotTank | undefined): void {
+    const color = this.combatEventColor(event, snapshot);
+    const angle = event.angle ?? 0;
+
+    if (event.targetKind && event.targetId) {
+      const flashColor = event.kind === 'body_player' || event.kind === 'projectile_player' || event.kind === 'player_destroyed' ? 0xfff1a8 : color;
+      this.flashTarget(event.targetKind, event.targetId, flashColor, event.kind.includes('destroyed') ? 230 : 150);
+    }
+    if (event.kind === 'body_player' && event.sourceId) {
+      this.flashTarget('player', event.sourceId, 0xfff1a8, 140);
+    }
+
+    if (event.kind === 'shot') {
+      this.spawnRing(event.x, event.y, color, 3, 24 + event.strength * 8, 3, 120);
+      this.spawnBurst(event, 7, color, 250, 115, 3.1, angle, 0.85);
+    } else if (event.kind === 'projectile_shape') {
+      this.spawnRing(event.x, event.y, 0xfff1a8, 5, 34 + event.strength * 8, 3, 160);
+      this.spawnBurst(event, 11, 0xfff1a8, 290, 170, 3.5, angle + Math.PI, 1.45);
+    } else if (event.kind === 'projectile_player') {
+      this.spawnRing(event.x, event.y, 0xfff1a8, 6, 40 + event.strength * 10, 4, 170);
+      this.spawnBurst(event, 15, 0xfff1a8, 340, 185, 3.8, angle + Math.PI, 1.65);
+    } else if (event.kind === 'body_shape') {
+      this.spawnRing(event.x, event.y, 0xffb84d, 9, 44 + event.strength * 12, 5, 180);
+      this.spawnBurst(event, 12, 0xffb84d, 230, 210, 4.4, angle, 2.3);
+    } else if (event.kind === 'body_player') {
+      this.spawnRing(event.x, event.y, 0xeefaff, 10, 50 + event.strength * 12, 5, 185);
+      this.spawnBurst(event, 16, 0xeefaff, 270, 210, 4.6, angle, 2.5);
+    } else if (event.kind === 'shape_destroyed') {
+      this.spawnRing(event.x, event.y, 0xfff1a8, 12, 72 + event.strength * 18, 5, 260);
+      this.spawnRing(event.x, event.y, color, 4, 46 + event.strength * 14, 3, 190);
+      this.spawnBurst(event, 28, color, 360, 290, 4.4);
+    } else if (event.kind === 'player_destroyed') {
+      this.spawnRing(event.x, event.y, 0xeefaff, 14, 84 + event.strength * 20, 6, 280);
+      this.spawnRing(event.x, event.y, color, 6, 52 + event.strength * 16, 4, 210);
+      this.spawnBurst(event, 34, color, 430, 320, 4.8);
+    }
+
+    this.spawnRewardFeedback(event, self);
+    this.applyShakeForEvent(event, self);
+  }
+
+  private spawnRewardFeedback(event: CombatFeedbackEvent, self: SnapshotTank | undefined): void {
+    if (!self || event.sourceId !== self.id || event.xpGain === undefined || event.xpGain <= 0) return;
+    const xpGain = Math.floor(event.xpGain);
+    const xpAfter = event.xpAfter ?? xpGain;
+    const levelAfter = event.levelAfter ?? levelForXp(xpAfter);
+    const levelBefore = levelForXp(Math.max(0, xpAfter - xpGain));
+
+    this.spawnRewardFloat(event.x, event.y, `+${xpGain.toLocaleString()} XP`, '#fff15a', false, 920);
+    if (levelAfter > levelBefore) {
+      this.spawnRewardFloat(event.x, event.y - 34, `LEVEL ${levelAfter}`, '#42d7ff', true, 1120);
+    }
+  }
+
+  private spawnRewardFloat(x: number, y: number, text: string, color: string, strong: boolean, lifeMs: number): void {
+    const label = this.add.text(0, 0, text, {
+      fontFamily: '"Trebuchet MS", "Arial Rounded MT Bold", Arial, sans-serif',
+      fontSize: strong ? '25px' : '18px',
+      fontStyle: '900',
+      color,
+      stroke: '#06325f',
+      strokeThickness: strong ? 7 : 5,
+      shadow: {
+        offsetX: 0,
+        offsetY: 3,
+        color: 'rgba(0, 0, 0, 0.28)',
+        blur: 0,
+        fill: true,
+      },
+    });
+    label.setOrigin(0.5);
+    label.setDepth(strong ? 48 : 44);
+    this.rewardFloats.push({ x, y, label, lifeMs, maxLifeMs: lifeMs, strong });
+    while (this.rewardFloats.length > 26) {
+      this.rewardFloats.shift()?.label.destroy();
+    }
+  }
+
+  private spawnBurst(
+    event: CombatFeedbackEvent,
+    count: number,
+    color: number,
+    speed: number,
+    lifeMs: number,
+    radius: number,
+    angle?: number,
+    spread = Math.PI * 2,
+  ): void {
+    for (let index = 0; index < count; index += 1) {
+      const theta = angle === undefined ? Math.random() * Math.PI * 2 : angle + (Math.random() - 0.5) * spread;
+      const particleSpeed = speed * event.strength * (0.42 + Math.random() * 0.78);
+      this.impactParticles.push({
+        x: event.x,
+        y: event.y,
+        vx: Math.cos(theta) * particleSpeed,
+        vy: Math.sin(theta) * particleSpeed,
+        radius: radius * (0.65 + Math.random() * 0.65),
+        color,
+        lifeMs: lifeMs * (0.72 + Math.random() * 0.5),
+        maxLifeMs: lifeMs,
+      });
+    }
+    if (this.impactParticles.length > MAX_IMPACT_PARTICLES) {
+      this.impactParticles.splice(0, this.impactParticles.length - MAX_IMPACT_PARTICLES);
+    }
+  }
+
+  private spawnRing(x: number, y: number, color: number, startRadius: number, endRadius: number, lineWidth: number, lifeMs: number): void {
+    this.impactRings.push({
+      x,
+      y,
+      color,
+      startRadius,
+      endRadius,
+      lineWidth,
+      lifeMs,
+      maxLifeMs: lifeMs,
+    });
+    if (this.impactRings.length > 80) this.impactRings.splice(0, this.impactRings.length - 80);
+  }
+
+  private flashTarget(targetKind: FlashTargetKind, targetId: string, color: number, lifeMs: number): void {
+    this.targetFlashes.set(`${targetKind}:${targetId}`, {
+      targetKind,
+      targetId,
+      color,
+      lifeMs,
+      maxLifeMs: lifeMs,
+    });
+  }
+
+  private getTargetFlash(targetKind: FlashTargetKind, targetId: string): TargetFlash | undefined {
+    return this.targetFlashes.get(`${targetKind}:${targetId}`);
+  }
+
+  private flashAlpha(flash: TargetFlash): number {
+    return clamp01(flash.lifeMs / flash.maxLifeMs);
+  }
+
+  private drawCombatEffects(cameraX: number, cameraY: number, delta: number): void {
+    const safeDelta = Math.min(64, delta);
+    const dt = safeDelta / 1000;
+
+    for (let index = this.impactRings.length - 1; index >= 0; index -= 1) {
+      const ring = this.impactRings[index];
+      ring.lifeMs -= safeDelta;
+      if (ring.lifeMs <= 0) {
+        this.impactRings.splice(index, 1);
+        continue;
+      }
+      const progress = 1 - ring.lifeMs / ring.maxLifeMs;
+      const alpha = (1 - progress) * 0.78;
+      const radius = lerp(ring.startRadius, ring.endRadius, easeOutCubic(progress));
+      const point = this.worldToScreen(ring.x, ring.y, cameraX, cameraY);
+      this.graphics.lineStyle(ring.lineWidth * (1 - progress * 0.45), ring.color, alpha);
+      this.graphics.strokeCircle(point.x, point.y, radius);
+    }
+
+    for (let index = this.impactParticles.length - 1; index >= 0; index -= 1) {
+      const particle = this.impactParticles[index];
+      particle.lifeMs -= safeDelta;
+      if (particle.lifeMs <= 0) {
+        this.impactParticles.splice(index, 1);
+        continue;
+      }
+      particle.x += particle.vx * dt;
+      particle.y += particle.vy * dt;
+      particle.vx *= 0.9;
+      particle.vy *= 0.9;
+      const alpha = clamp01(particle.lifeMs / particle.maxLifeMs);
+      const point = this.worldToScreen(particle.x, particle.y, cameraX, cameraY);
+      this.graphics.fillStyle(particle.color, alpha);
+      this.graphics.fillCircle(point.x, point.y, particle.radius * (0.75 + alpha * 0.35));
+    }
+
+    for (let index = this.rewardFloats.length - 1; index >= 0; index -= 1) {
+      const reward = this.rewardFloats[index];
+      reward.lifeMs -= safeDelta;
+      if (reward.lifeMs <= 0) {
+        reward.label.destroy();
+        this.rewardFloats.splice(index, 1);
+        continue;
+      }
+      const progress = 1 - reward.lifeMs / reward.maxLifeMs;
+      const rise = reward.strong ? 78 : 54;
+      const point = this.worldToScreen(reward.x, reward.y - easeOutCubic(progress) * rise, cameraX, cameraY);
+      const fadeIn = Math.min(1, progress / 0.16);
+      const fadeOut = clamp01(reward.lifeMs / 240);
+      reward.label.setPosition(point.x, point.y);
+      reward.label.setAlpha(Math.min(fadeIn, fadeOut));
+      reward.label.setScale(reward.strong ? 1.06 + (1 - progress) * 0.18 : 1);
+    }
+
+    for (const [key, flash] of this.targetFlashes) {
+      flash.lifeMs -= safeDelta;
+      if (flash.lifeMs <= 0) this.targetFlashes.delete(key);
+    }
+  }
+
+  private applyShakeForEvent(event: CombatFeedbackEvent, self: SnapshotTank | undefined): void {
+    if (!self) return;
+    const selfInvolved = event.sourceId === self.id || event.targetId === self.id;
+    const impactDistance = Math.hypot(event.x - self.x, event.y - self.y);
+    if (!selfInvolved && (event.kind === 'shot' || impactDistance > NEARBY_SHAKE_DISTANCE)) return;
+
+    const falloff = selfInvolved ? 1 : 1 - impactDistance / NEARBY_SHAKE_DISTANCE;
+    const weight =
+      event.kind === 'shot'
+        ? 0.09
+        : event.kind === 'projectile_shape'
+          ? 0.13
+          : event.kind === 'projectile_player'
+            ? 0.16
+            : event.kind === 'body_shape'
+              ? 0.18
+              : event.kind === 'body_player'
+                ? 0.22
+                : event.kind === 'shape_destroyed'
+                  ? 0.26
+                  : 0.34;
+    this.shakeTrauma = Math.min(0.72, this.shakeTrauma + weight * event.strength * Math.max(0, falloff));
+  }
+
+  private getCameraShakeOffset(delta: number): { x: number; y: number } {
+    this.shakeTrauma = Math.max(0, this.shakeTrauma - delta / 280);
+    if (this.shakeTrauma <= 0) return { x: 0, y: 0 };
+    const amount = this.shakeTrauma * this.shakeTrauma * 18;
+    const time = this.game.loop.time;
+    return {
+      x: Math.sin(time * 0.073) * amount + Math.sin(time * 0.041) * amount * 0.35,
+      y: Math.cos(time * 0.061) * amount + Math.sin(time * 0.053) * amount * 0.35,
+    };
+  }
+
+  private combatEventColor(event: CombatFeedbackEvent, snapshot: GameSnapshot): number {
+    if (event.kind === 'projectile_shape' || event.kind === 'body_shape' || event.kind === 'shape_destroyed') {
+      const shape = event.targetId ? snapshot.shapes.find((entry) => entry.id === event.targetId) : undefined;
+      if (shape) return shape.shape === 'square' ? 0xffe45c : shape.shape === 'triangle' ? 0xff6b7a : shape.shape === 'pentagon' ? 0x5f8cff : 0x8f6bff;
+      return 0xffe45c;
+    }
+
+    const player = event.targetId
+      ? snapshot.players.find((entry) => entry.id === event.targetId)
+      : event.sourceId
+        ? snapshot.players.find((entry) => entry.id === event.sourceId)
+        : undefined;
+    return player ? parseColor(player.color) : 0x35d0ff;
+  }
+
+  private clearCombatVisuals(): void {
+    this.seenCombatEventIds.clear();
+    this.seenCombatEventOrder.length = 0;
+    this.impactParticles.length = 0;
+    this.impactRings.length = 0;
+    this.targetFlashes.clear();
+    for (const reward of this.rewardFloats) {
+      reward.label.destroy();
+    }
+    this.rewardFloats.length = 0;
+    this.lastCombatRoomId = '';
+    this.shakeTrauma = 0;
   }
 
   private drawGrid(cameraX: number, cameraY: number): void {
@@ -1026,69 +1504,45 @@ const statLabels: Record<StatKey, string> = {
   movementSpeed: 'Move',
 };
 
-function interpolateSnapshots(previous: GameSnapshot, next: GameSnapshot, alpha: number): GameSnapshot {
-  const previousPlayers = keyed(previous.players);
-  const previousProjectiles = keyed(previous.projectiles);
-  const previousShapes = keyed(previous.shapes);
+function statKeyForHotkey(event: KeyboardEvent): StatKey | undefined {
+  const match = /^(?:Digit|Numpad)([1-8])$/.exec(event.code);
+  if (!match) return undefined;
+  return STAT_KEYS[Number(match[1]) - 1];
+}
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+}
+
+function getLevelProgress(xp: number, level: number): {
+  currentXp: number;
+  nextXp: number;
+  neededXp: number;
+  progress: number;
+  isMaxLevel: boolean;
+} {
+  const currentXp = Math.max(0, Math.floor(xp));
+  if (level >= MAX_LEVEL) {
+    return {
+      currentXp,
+      nextXp: currentXp,
+      neededXp: 0,
+      progress: 1,
+      isMaxLevel: true,
+    };
+  }
+
+  const levelStartXp = xpRequiredForLevel(level);
+  const nextXp = xpRequiredForLevel(level + 1);
+  const levelRange = Math.max(1, nextXp - levelStartXp);
   return {
-    ...next,
-    now: lerp(previous.now, next.now, alpha),
-    players: next.players.map((player) => interpolateTank(previousPlayers.get(player.id), player, alpha)),
-    projectiles: next.projectiles.map((projectile) => interpolateProjectile(previousProjectiles.get(projectile.id), projectile, alpha)),
-    shapes: next.shapes.map((shape) => interpolateShape(previousShapes.get(shape.id), shape, alpha)),
+    currentXp,
+    nextXp,
+    neededXp: Math.max(0, nextXp - currentXp),
+    progress: clamp01((currentXp - levelStartXp) / levelRange),
+    isMaxLevel: false,
   };
-}
-
-function interpolateTank(previous: SnapshotTank | undefined, next: SnapshotTank, alpha: number): SnapshotTank {
-  if (!previous) return next;
-  return {
-    ...next,
-    x: lerp(previous.x, next.x, alpha),
-    y: lerp(previous.y, next.y, alpha),
-    aim: lerpAngle(previous.aim, next.aim, alpha),
-    radius: lerp(previous.radius, next.radius, alpha),
-    health: lerp(previous.health, next.health, alpha),
-    maxHealth: lerp(previous.maxHealth, next.maxHealth, alpha),
-  };
-}
-
-function interpolateProjectile(previous: SnapshotProjectile | undefined, next: SnapshotProjectile, alpha: number): SnapshotProjectile {
-  if (!previous || previous.kind !== next.kind) return next;
-  return {
-    ...next,
-    x: lerp(previous.x, next.x, alpha),
-    y: lerp(previous.y, next.y, alpha),
-    radius: lerp(previous.radius, next.radius, alpha),
-  };
-}
-
-function interpolateShape(previous: SnapshotShape | undefined, next: SnapshotShape, alpha: number): SnapshotShape {
-  if (!previous || previous.shape !== next.shape) return next;
-  return {
-    ...next,
-    x: lerp(previous.x, next.x, alpha),
-    y: lerp(previous.y, next.y, alpha),
-    hp: lerp(previous.hp, next.hp, alpha),
-    rotation: lerpAngle(previous.rotation, next.rotation, alpha),
-  };
-}
-
-function keyed<T extends { id: string }>(items: T[]): Map<string, T> {
-  return new Map(items.map((item) => [item.id, item]));
-}
-
-function lerp(a: number, b: number, alpha: number): number {
-  return a + (b - a) * alpha;
-}
-
-function lerpAngle(a: number, b: number, alpha: number): number {
-  const delta = Math.atan2(Math.sin(b - a), Math.cos(b - a));
-  return a + delta * alpha;
-}
-
-function clamp01(value: number): number {
-  return Math.min(1, Math.max(0, value));
 }
 
 function keyDown(key?: Phaser.Input.Keyboard.Key): boolean {
@@ -1097,6 +1551,33 @@ function keyDown(key?: Phaser.Input.Keyboard.Key): boolean {
 
 function parseColor(value: string): number {
   return Number.parseInt(value.replace('#', ''), 16);
+}
+
+function renderTankDexRequirementShort(entry: TankDexEntry): string {
+  if (entry.tank.tier === 1) return 'Starter';
+  const requiredLevel = entry.tank.unlockLevel;
+  const hasSkippedUpgrade = entry.paths.some((path) => path.segments.some((segment) => segment.requiresSkippedUpgrade));
+  return `LV ${requiredLevel}${hasSkippedUpgrade ? ' skip' : ''}`;
+}
+
+function renderTankDexPath(path: TankDexEntry['paths'][number]): string {
+  if (path.segments.length === 0) {
+    return '<div class="tank-dex-path"><strong>Basic</strong><small>Starter tank</small></div>';
+  }
+
+  const segmentLabels = path.segments
+    .map((segment) => {
+      const skip = segment.requiresSkippedUpgrade ? ' skipped upgrade' : '';
+      return `LV ${segment.requiredLevel} ${escapeHtml(segment.toDisplayName)}${skip}`;
+    })
+    .join(' / ');
+
+  return `
+    <div class="tank-dex-path">
+      <strong>${path.displayNames.map((name) => escapeHtml(name)).join(' > ')}</strong>
+      <small>${segmentLabels}</small>
+    </div>
+  `;
 }
 
 function renderLeaderboardRow(entry: LeaderboardEntry, index: number): string {
@@ -1139,7 +1620,7 @@ function renderStarterPaths(): string {
     return `
       <div class="path-card ${cardClass}">
         <span class="path-card-corner" aria-hidden="true"></span>
-        <img src="${asset}" alt="${escapeHtml(tankClass.displayName)} tank class icon" />
+        <img src="${asset}" loading="lazy" decoding="async" alt="${escapeHtml(tankClass.displayName)} tank class icon" />
         <strong>${escapeHtml(tankClass.displayName)}</strong>
         <b>${escapeHtml(tags)}</b>
       </div>

@@ -8,7 +8,7 @@ import {
   normalizeStatsForTank,
   upgradeOptions,
 } from './progression';
-import type { ClientInputPayload, GameSnapshot } from './protocol';
+import type { ClientInputPayload, CombatFeedbackEvent, GameSnapshot } from './protocol';
 import type { ProjectileKind, StatAllocation, StatKey, WeaponMount } from './tankTypes';
 import { getTankClass, TANK_CLASSES_BY_ID } from './tanks';
 
@@ -19,6 +19,9 @@ const PLAYER_RESPAWN_MS = 2200;
 const INPUT_DEADZONE = 0.05;
 const SAFE_SPAWN_DISTANCE = 700;
 const SPAWN_CANDIDATE_LIMIT = 64;
+const COMBAT_EVENT_TTL_MS = 420;
+const BODY_IMPACT_COOLDOWN_MS = 180;
+const COMBAT_EVENT_VISIBILITY_MARGIN = 320;
 
 type ShapeKind = 'square' | 'triangle' | 'pentagon' | 'alpha_pentagon';
 
@@ -28,6 +31,10 @@ interface SnapshotEvent {
   message: string;
   at: number;
 }
+
+export type MatchCombatFeedbackEvent = CombatFeedbackEvent & {
+  at: number;
+};
 
 export interface MatchInput extends ClientInputPayload {
   lastSeenAt: number;
@@ -115,6 +122,13 @@ export interface SimulationDeath {
   durationSeconds: number;
 }
 
+interface XpAward {
+  xpGain: number;
+  xpAfter: number;
+  levelBefore: number;
+  levelAfter: number;
+}
+
 export interface GameRoom {
   id: string;
   now: number;
@@ -124,6 +138,8 @@ export interface GameRoom {
   projectiles: Map<string, MatchProjectile>;
   shapes: Map<string, MatchShape>;
   events: SnapshotEvent[];
+  combatEvents: MatchCombatFeedbackEvent[];
+  bodyImpactCooldowns: Map<string, number>;
   sequence: number;
   rng: () => number;
 }
@@ -171,6 +187,8 @@ export function createRoom(id = 'ffa-main', seed = Date.now()): GameRoom {
     projectiles: new Map(),
     shapes: new Map(),
     events: [],
+    combatEvents: [],
+    bodyImpactCooldowns: new Map(),
     sequence: 0,
     rng: mulberry32(seed),
   };
@@ -250,12 +268,15 @@ export function upgradePlayerStat(room: GameRoom, playerId: string, stat: StatKe
   if (!player || !player.alive) return false;
   if (availableStatPoints(player.level, player.stats) <= 0) return false;
   if (!canAllocateStat(player.tankId, player.stats, stat)) return false;
+  const previousDerived = deriveTankStats(player.tankId, player.level, player.stats);
   player.stats = {
     ...player.stats,
     [stat]: player.stats[stat] + 1,
   };
   const derived = deriveTankStats(player.tankId, player.level, player.stats);
-  player.health = Math.min(derived.maxHealth, player.health + 16);
+  // Health investment should grant the actual new capacity immediately.
+  const healAmount = stat === 'maxHealth' ? Math.max(0, derived.maxHealth - previousDerived.maxHealth) : 16;
+  player.health = Math.min(derived.maxHealth, player.health + healAmount);
   return true;
 }
 
@@ -296,15 +317,17 @@ export function updateRoom(room: GameRoom, dtMs: number): SimulationDeath[] {
 }
 
 export function snapshotForPlayer(room: GameRoom, playerId: string): GameSnapshot {
-  const self = room.players.get(playerId) ?? [...room.players.values()][0];
-  const selfDerived = self ? deriveTankStats(self.tankId, self.level, self.stats) : undefined;
-  const visibleRadius = 1200 * (selfDerived?.fovMultiplier ?? 1);
+  const self = room.players.get(playerId);
+  if (!self) return emptySnapshot(room, playerId);
+
+  const selfDerived = deriveTankStats(self.tankId, self.level, self.stats);
+  const visibleRadius = 1200 * selfDerived.fovMultiplier;
   const players = [...room.players.values()]
-    .filter((player) => !self || distance(player, self) <= visibleRadius || player.id === self.id)
+    .filter((player) => distance(player, self) <= visibleRadius || player.id === self.id)
     .map((player) => {
       const derived = deriveTankStats(player.tankId, player.level, player.stats);
       const invisible =
-        player.id !== self?.id &&
+        player.id !== self.id &&
         getTankClass(player.tankId).abilities.includes('invisibility') &&
         player.stealthMs > 2000 &&
         player.revealedMs <= 0;
@@ -329,7 +352,7 @@ export function snapshotForPlayer(room: GameRoom, playerId: string): GameSnapsho
     });
 
   const shapes = [...room.shapes.values()]
-    .filter((shape) => !self || distance(shape, self) <= visibleRadius + 240)
+    .filter((shape) => distance(shape, self) <= visibleRadius + 240)
     .map((shape) => ({
       id: shape.id,
       shape: shape.shape,
@@ -342,7 +365,7 @@ export function snapshotForPlayer(room: GameRoom, playerId: string): GameSnapsho
     }));
 
   const projectiles = [...room.projectiles.values()]
-    .filter((projectile) => !self || distance(projectile, self) <= visibleRadius + 240)
+    .filter((projectile) => distance(projectile, self) <= visibleRadius + 240)
     .map((projectile) => ({
       id: projectile.id,
       ownerId: projectile.ownerId,
@@ -353,25 +376,36 @@ export function snapshotForPlayer(room: GameRoom, playerId: string): GameSnapsho
       color: projectile.color,
     }));
 
-  const fallbackSelf = self ?? addPlayer(room, { id: nextId(room, 'fallback'), name: 'Pilot' });
   const selfState = {
-    id: fallbackSelf.id,
-    tankId: fallbackSelf.tankId,
-    level: fallbackSelf.level,
-    xp: Math.floor(fallbackSelf.xp),
-    score: Math.floor(fallbackSelf.score),
-    stats: fallbackSelf.stats,
-    availableStatPoints: availableStatPoints(fallbackSelf.level, fallbackSelf.stats),
-    upgradeOptions: upgradeOptions(fallbackSelf.tankId, fallbackSelf.level).map((tankClass) => tankClass.id),
-    alive: fallbackSelf.alive,
-    respawnMs: Math.max(0, Math.ceil(fallbackSelf.respawnMs)),
-    sessionXp: Math.floor(fallbackSelf.sessionXp),
+    id: self.id,
+    tankId: self.tankId,
+    level: self.level,
+    xp: Math.floor(self.xp),
+    score: Math.floor(self.score),
+    stats: self.stats,
+    availableStatPoints: availableStatPoints(self.level, self.stats),
+    upgradeOptions: upgradeOptions(self.tankId, self.level).map((tankClass) => tankClass.id),
+    alive: self.alive,
+    respawnMs: Math.max(0, Math.ceil(self.respawnMs)),
+    sessionXp: Math.floor(self.sessionXp),
   };
+  const combatEvents = room.combatEvents
+    .filter((event) => combatEventVisibleTo(event, self, visibleRadius + COMBAT_EVENT_VISIBILITY_MARGIN))
+    .map((event) => {
+      const { at: _at, ...snapshotEvent } = event;
+      return {
+        ...snapshotEvent,
+        x: round(snapshotEvent.x),
+        y: round(snapshotEvent.y),
+        strength: round(snapshotEvent.strength),
+        angle: snapshotEvent.angle === undefined ? undefined : round(snapshotEvent.angle),
+      };
+    });
 
   return {
     type: 'snapshot',
     roomId: room.id,
-    selfId: fallbackSelf.id,
+    selfId: self.id,
     now: room.now,
     world: {
       width: room.width,
@@ -392,6 +426,38 @@ export function snapshotForPlayer(room: GameRoom, playerId: string): GameSnapsho
         tankId: player.tankId,
         bot: player.bot,
       })),
+    combatEvents,
+  };
+}
+
+function emptySnapshot(room: GameRoom, playerId: string): GameSnapshot {
+  return {
+    type: 'snapshot',
+    roomId: room.id,
+    selfId: playerId,
+    now: room.now,
+    world: {
+      width: room.width,
+      height: room.height,
+    },
+    self: {
+      id: playerId,
+      tankId: 'basic',
+      level: 1,
+      xp: 0,
+      score: 0,
+      stats: { ...DEFAULT_STATS },
+      availableStatPoints: 0,
+      upgradeOptions: [],
+      alive: false,
+      respawnMs: 0,
+      sessionXp: 0,
+    },
+    players: [],
+    projectiles: [],
+    shapes: [],
+    leaderboard: [],
+    combatEvents: [],
   };
 }
 
@@ -519,6 +585,14 @@ function spawnProjectile(room: GameRoom, player: MatchPlayer, weapon: WeaponMoun
   }
 
   room.projectiles.set(projectile.id, projectile);
+  pushCombatEvent(room, {
+    kind: 'shot',
+    x: projectile.x,
+    y: projectile.y,
+    sourceId: player.id,
+    angle,
+    strength: 0.75 + radius / 18,
+  });
 
   const recoil = (weapon.recoil ?? 0) * 0.08;
   player.x = clamp(player.x - Math.cos(angle) * recoil, 0, room.width);
@@ -559,11 +633,33 @@ function resolveProjectileCollisions(room: GameRoom, deaths: SimulationDeath[]):
   for (const projectile of [...room.projectiles.values()]) {
     for (const shape of [...room.shapes.values()]) {
       if (!circlesOverlap(projectile, shape)) continue;
+      const impactAngle = Math.atan2(projectile.vy, projectile.vx);
       shape.hp -= projectile.damage;
       projectile.penetration -= shape.radius * 1.6;
+      pushCombatEvent(room, {
+        kind: 'projectile_shape',
+        x: projectile.x,
+        y: projectile.y,
+        sourceId: projectile.ownerId,
+        targetId: shape.id,
+        targetKind: 'shape',
+        angle: impactAngle,
+        strength: 0.7 + Math.min(1.2, projectile.damage / 55),
+      });
       if (shape.hp <= 0) {
         room.shapes.delete(shape.id);
-        awardXp(room, projectile.ownerId, shape.xp, shape.xp);
+        const award = awardXp(room, projectile.ownerId, shape.xp, shape.xp);
+        pushCombatEvent(room, {
+          kind: 'shape_destroyed',
+          x: shape.x,
+          y: shape.y,
+          sourceId: projectile.ownerId,
+          targetId: shape.id,
+          targetKind: 'shape',
+          angle: impactAngle,
+          strength: 1.1 + shape.radius / 38,
+          ...rewardEventFields(award),
+        });
       }
       if (projectile.penetration <= 0) {
         room.projectiles.delete(projectile.id);
@@ -577,7 +673,18 @@ function resolveProjectileCollisions(room: GameRoom, deaths: SimulationDeath[]):
       if (!player.alive || player.id === projectile.ownerId || player.invulnerableMs > 0) continue;
       const derived = deriveTankStats(player.tankId, player.level, player.stats);
       if (!circleValuesOverlap(projectile.x, projectile.y, projectile.radius, player.x, player.y, derived.radius)) continue;
+      const impactAngle = Math.atan2(projectile.vy, projectile.vx);
       damagePlayer(room, player, projectile.damage, projectile.ownerId, deaths);
+      pushCombatEvent(room, {
+        kind: 'projectile_player',
+        x: projectile.x,
+        y: projectile.y,
+        sourceId: projectile.ownerId,
+        targetId: player.id,
+        targetKind: 'player',
+        angle: impactAngle,
+        strength: 0.85 + Math.min(1.35, projectile.damage / 50),
+      });
       projectile.penetration -= derived.radius * 2;
       if (projectile.penetration <= 0) {
         room.projectiles.delete(projectile.id);
@@ -594,12 +701,34 @@ function resolveBodyCollisions(room: GameRoom, deaths: SimulationDeath[], dt: nu
     for (const shape of [...room.shapes.values()]) {
       if (!circleValuesOverlap(player.x, player.y, playerDerived.radius, shape.x, shape.y, shape.radius)) continue;
       const damage = playerDerived.bodyDamage * dt * 2.4;
+      const impactAngle = Math.atan2(player.y - shape.y, player.x - shape.x);
+      pushBodyImpactEvent(room, bodyImpactKey('shape', player.id, shape.id), {
+        kind: 'body_shape',
+        x: (player.x + shape.x) / 2,
+        y: (player.y + shape.y) / 2,
+        sourceId: player.id,
+        targetId: shape.id,
+        targetKind: 'shape',
+        angle: impactAngle,
+        strength: 0.8 + Math.min(1.1, playerDerived.bodyDamage / 36),
+      });
       shape.hp -= damage;
       if (player.invulnerableMs <= 0) player.health -= Math.max(2, shape.radius * 0.16) * dt * 18;
       separate(player, shape, playerDerived.radius, shape.radius, 0.45);
       if (shape.hp <= 0) {
         room.shapes.delete(shape.id);
-        awardXp(room, player.id, shape.xp, shape.xp);
+        const award = awardXp(room, player.id, shape.xp, shape.xp);
+        pushCombatEvent(room, {
+          kind: 'shape_destroyed',
+          x: shape.x,
+          y: shape.y,
+          sourceId: player.id,
+          targetId: shape.id,
+          targetKind: 'shape',
+          angle: impactAngle,
+          strength: 1.05 + shape.radius / 40,
+          ...rewardEventFields(award),
+        });
       }
       if (player.health <= 0) killPlayer(room, player, undefined, deaths);
     }
@@ -612,6 +741,16 @@ function resolveBodyCollisions(room: GameRoom, deaths: SimulationDeath[], dt: nu
       const aDerived = deriveTankStats(a.tankId, a.level, a.stats);
       const bDerived = deriveTankStats(b.tankId, b.level, b.stats);
       if (!circleValuesOverlap(a.x, a.y, aDerived.radius, b.x, b.y, bDerived.radius)) continue;
+      pushBodyImpactEvent(room, bodyImpactKey('player', a.id, b.id), {
+        kind: 'body_player',
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2,
+        sourceId: a.id,
+        targetId: b.id,
+        targetKind: 'player',
+        angle: Math.atan2(b.y - a.y, b.x - a.x),
+        strength: 0.95 + Math.min(1.2, (aDerived.bodyDamage + bDerived.bodyDamage) / 72),
+      });
       if (a.invulnerableMs <= 0) damagePlayer(room, a, bDerived.bodyDamage * dt * 2.2, b.id, deaths);
       if (b.invulnerableMs <= 0) damagePlayer(room, b, aDerived.bodyDamage * dt * 2.2, a.id, deaths);
       separate(a, b, aDerived.radius, bDerived.radius, 0.5);
@@ -628,6 +767,7 @@ function damagePlayer(room: GameRoom, player: MatchPlayer, damage: number, attac
 function killPlayer(room: GameRoom, victim: MatchPlayer, killerId: string | undefined, deaths: SimulationDeath[]): void {
   if (!victim.alive) return;
   const killer = killerId ? room.players.get(killerId) : undefined;
+  let killerAward: XpAward | undefined;
   victim.alive = false;
   victim.respawnMs = victim.bot ? PLAYER_RESPAWN_MS : 0;
   victim.deaths += 1;
@@ -635,7 +775,20 @@ function killPlayer(room: GameRoom, victim: MatchPlayer, killerId: string | unde
   victim.revealedMs = 1200;
   if (killer && killer.id !== victim.id) {
     killer.kills += 1;
-    awardXp(room, killer.id, Math.max(120, victim.score * 0.08), Math.max(120, victim.score * 0.08));
+    killerAward = awardXp(room, killer.id, Math.max(120, victim.score * 0.08), Math.max(120, victim.score * 0.08));
+  }
+  pushCombatEvent(room, {
+    kind: 'player_destroyed',
+    x: victim.x,
+    y: victim.y,
+    sourceId: killer?.id,
+    targetId: victim.id,
+    targetKind: 'player',
+    angle: killer ? Math.atan2(victim.y - killer.y, victim.x - killer.x) : victim.aim,
+    strength: 1.85,
+    ...rewardEventFields(killerAward),
+  });
+  if (killer && killer.id !== victim.id) {
     pushEvent(room, 'kill', `${killer.name} destroyed ${victim.name}.`);
   } else {
     pushEvent(room, 'kill', `${victim.name} was destroyed.`);
@@ -684,9 +837,9 @@ function respawnPlayer(room: GameRoom, player: MatchPlayer): void {
   player.health = deriveTankStats(player.tankId, player.level, player.stats).maxHealth;
 }
 
-function awardXp(room: GameRoom, playerId: string, xp: number, score: number): void {
+function awardXp(room: GameRoom, playerId: string, xp: number, score: number): XpAward | undefined {
   const player = room.players.get(playerId);
-  if (!player || !player.alive) return;
+  if (!player || !player.alive) return undefined;
   const previousLevel = player.level;
   player.xp += xp;
   player.sessionXp += xp;
@@ -697,6 +850,12 @@ function awardXp(room: GameRoom, playerId: string, xp: number, score: number): v
     player.health = Math.min(derived.maxHealth, player.health + (player.level - previousLevel) * 18);
     pushEvent(room, 'level', `${player.name} reached level ${player.level}.`);
   }
+  return {
+    xpGain: Math.floor(xp),
+    xpAfter: Math.floor(player.xp),
+    levelBefore: previousLevel,
+    levelAfter: player.level,
+  };
 }
 
 function updateBot(room: GameRoom, bot: MatchPlayer, dtMs: number): void {
@@ -857,6 +1016,44 @@ function cleanName(name: string): string {
   return cleaned.length > 0 ? cleaned.slice(0, 18) : 'Pilot';
 }
 
+function rewardEventFields(award: XpAward | undefined): Pick<CombatFeedbackEvent, 'xpGain' | 'xpAfter' | 'levelAfter'> {
+  if (!award) return {};
+  return {
+    xpGain: award.xpGain,
+    xpAfter: award.xpAfter,
+    levelAfter: award.levelAfter,
+  };
+}
+
+function pushCombatEvent(room: GameRoom, event: Omit<CombatFeedbackEvent, 'id'>): void {
+  room.combatEvents.push({
+    ...event,
+    id: nextId(room, 'c'),
+    x: clamp(event.x, 0, room.width),
+    y: clamp(event.y, 0, room.height),
+    strength: clamp(event.strength, 0.2, 3),
+    at: room.now,
+  });
+  if (room.combatEvents.length > 220) room.combatEvents.splice(0, room.combatEvents.length - 220);
+}
+
+function pushBodyImpactEvent(room: GameRoom, key: string, event: Omit<CombatFeedbackEvent, 'id'>): void {
+  const nextAllowedAt = room.bodyImpactCooldowns.get(key) ?? 0;
+  if (nextAllowedAt > room.now) return;
+  room.bodyImpactCooldowns.set(key, room.now + BODY_IMPACT_COOLDOWN_MS);
+  pushCombatEvent(room, event);
+}
+
+function combatEventVisibleTo(event: CombatFeedbackEvent, player: MatchPlayer, visibleRadius: number): boolean {
+  if (event.sourceId === player.id || event.targetId === player.id) return true;
+  return distance(event, player) <= visibleRadius;
+}
+
+function bodyImpactKey(kind: 'shape' | 'player', firstId: string, secondId: string): string {
+  if (kind === 'shape') return `shape:${firstId}:${secondId}`;
+  return `player:${[firstId, secondId].sort().join(':')}`;
+}
+
 function pushEvent(room: GameRoom, type: SnapshotEvent['type'], message: string): void {
   room.events.push({
     id: nextId(room, 'e'),
@@ -868,6 +1065,13 @@ function pushEvent(room: GameRoom, type: SnapshotEvent['type'], message: string)
 
 function trimEvents(room: GameRoom): void {
   if (room.events.length > 50) room.events.splice(0, room.events.length - 50);
+  const oldestCombatEventAt = room.now - COMBAT_EVENT_TTL_MS;
+  while (room.combatEvents[0] && room.combatEvents[0].at < oldestCombatEventAt) {
+    room.combatEvents.shift();
+  }
+  for (const [key, nextAllowedAt] of room.bodyImpactCooldowns) {
+    if (nextAllowedAt <= room.now) room.bodyImpactCooldowns.delete(key);
+  }
 }
 
 function splitProjectile(room: GameRoom, projectile: MatchProjectile): void {

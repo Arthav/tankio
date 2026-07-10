@@ -6,6 +6,14 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist/client',
-    sourcemap: true,
+    chunkSizeWarningLimit: 1500,
+    sourcemap: process.env.VITE_BUILD_SOURCEMAP === 'true',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          phaser: ['phaser'],
+        },
+      },
+    },
   },
 });

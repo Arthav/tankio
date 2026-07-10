@@ -2,6 +2,7 @@ import 'dotenv/config';
 import http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createPool } from './db/client';
+import { errorResponse, normalizeGuestRequestBody, readJsonBody } from './httpJson';
 import { MemoryProfileStore, PostgresProfileStore, type ProfileStore } from './profiles';
 import { RoomManager } from './roomManager';
 
@@ -35,29 +36,36 @@ roomManager.start();
 const server = http.createServer(async (request, response) => {
   setCors(response);
 
-  if (request.method === 'OPTIONS') {
-    response.writeHead(204);
-    response.end();
-    return;
-  }
+  try {
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
 
-  if (request.url === '/api/health') {
-    sendJson(response, 200, {
-      ok: true,
-      roomId: roomManager.room.id,
-      players: roomManager.room.players.size,
-    });
-    return;
-  }
+    if (request.url === '/api/health') {
+      sendJson(response, 200, {
+        ok: true,
+        roomId: roomManager.room.id,
+        players: roomManager.room.players.size,
+        rooms: roomManager.getRoomSummaries(),
+      });
+      return;
+    }
 
-  if (request.url === '/api/guest' && request.method === 'POST') {
-    const body = await readJson<{ token?: string; name?: string }>(request);
-    const profileResult = await store.getOrCreateGuest(body.token, body.name ?? 'Pilot');
-    sendJson(response, 200, profileResult);
-    return;
-  }
+    if (request.url === '/api/guest' && request.method === 'POST') {
+      const body = normalizeGuestRequestBody(await readJsonBody(request));
+      const profileResult = await store.getOrCreateGuest(body.token, body.name);
+      sendJson(response, 200, profileResult);
+      return;
+    }
 
-  sendJson(response, 404, { error: 'Not found.' });
+    sendJson(response, 404, { error: 'Not found.' });
+  } catch (error) {
+    const responseData = errorResponse(error);
+    if (responseData.status >= 500) console.error(error);
+    sendJson(response, responseData.status, responseData.body);
+  }
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -114,13 +122,4 @@ function setCors(response: http.ServerResponse): void {
 function sendJson(response: http.ServerResponse, status: number, data: unknown): void {
   response.writeHead(status, { 'Content-Type': 'application/json' });
   response.end(JSON.stringify(data));
-}
-
-async function readJson<T>(request: http.IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  if (chunks.length === 0) return {} as T;
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as T;
 }

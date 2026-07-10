@@ -75,6 +75,7 @@ export class MemoryProfileStore implements ProfileStore {
     if (input.kills >= 1) profile.achievements.add('first_destroy');
     if (input.finalScore >= 2500) profile.achievements.add('score_2500');
     if (input.bestTankId !== 'basic') profile.achievements.add('first_upgrade');
+    if (input.xpEarned >= 5000) profile.achievements.add('deep_run');
     if (profile.profileXp >= 8000) profile.customBranchUnlocks.add('tankio.experimental.alpha');
   }
 
